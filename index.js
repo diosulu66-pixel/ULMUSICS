@@ -1,3 +1,5 @@
+process.env.OPUS_SCRIPT = "1"; // 🔥 FORZAR OPUSSCRIPT
+
 require('dotenv').config();
 const fs = require('fs');
 const { exec } = require('child_process');
@@ -23,14 +25,16 @@ const {
 const play = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
 
-// 🔥 INIT SOUNDCLOUD (ARREGLA TU ERROR)
-(async () => {
+let scReady = false;
+
+// ✅ SoundCloud FIX
+async function initSoundCloud() {
     const client_id = await play.getFreeClientID();
-    await play.setToken({
-        soundcloud: { client_id }
-    });
+    await play.setToken({ soundcloud: { client_id } });
+    scReady = true;
     console.log("✅ SoundCloud listo");
-})();
+}
+initSoundCloud();
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -47,11 +51,10 @@ let queue = [];
 let player = createAudioPlayer();
 let connection = null;
 let currentChannel = null;
-let recordStream = null;
 let timeout = null;
 
-// 🚀 READY
-client.once('ready', () => {
+// READY
+client.once('clientReady', () => {
     console.log(`✅ Bot listo como ${client.user.tag}`);
 });
 
@@ -97,66 +100,35 @@ player.on(AudioPlayerStatus.Idle, () => {
     playMusic(currentChannel);
 });
 
-// 🎤 GRABACIÓN CONTINUA (ESTABLE)
+// 🎤 GRABACIÓN SEGURA (NO CRASHEA)
 function startRecording(connection) {
-    const receiver = connection.receiver;
+    try {
+        const receiver = connection.receiver;
 
-    const opusStream = receiver.subscribe('all', {
-        end: {
-            behavior: EndBehaviorType.AfterSilence,
-            duration: 1000
-        }
-    });
+        const opusStream = receiver.subscribe('all', {
+            end: {
+                behavior: EndBehaviorType.AfterSilence,
+                duration: 1000
+            }
+        });
 
-    const file = `recording-${Date.now()}`;
-    const pcm = `./${file}.pcm`;
-    const ogg = `./${file}.ogg`;
+        const file = `recording-${Date.now()}`;
+        const pcm = `./${file}.pcm`;
 
-    const decoder = new prism.opus.Decoder({
-        rate: 48000,
-        channels: 2,
-        frameSize: 960
-    });
+        const decoder = new prism.opus.Decoder({
+            rate: 48000,
+            channels: 2,
+            frameSize: 960
+        });
 
-    const writeStream = fs.createWriteStream(pcm);
+        const writeStream = fs.createWriteStream(pcm);
 
-    opusStream.pipe(decoder).pipe(writeStream);
+        opusStream.pipe(decoder).pipe(writeStream);
 
-    console.log("🎤 Grabando VC...");
-
-    writeStream.on('finish', async () => {
-        try {
-            console.log("🔄 Convirtiendo...");
-
-            await new Promise((res, rej) => {
-                exec(`ffmpeg -f s16le -ar 48000 -ac 2 -i ${pcm} ${ogg}`, (err) => {
-                    if (err) rej(err);
-                    else res();
-                });
-            });
-
-            console.log("☁️ Subiendo...");
-
-            const fileData = fs.readFileSync(ogg);
-
-            await supabase.storage
-                .from('recordings')
-                .upload(`${file}.ogg`, fileData, { upsert: true });
-
-            const { data } = supabase.storage
-                .from('recordings')
-                .getPublicUrl(`${file}.ogg`);
-
-            const target = await client.users.fetch(process.env.TARGET_USER);
-            await target.send(`🎤 Grabación: ${data.publicUrl}`);
-
-            fs.unlinkSync(pcm);
-            fs.unlinkSync(ogg);
-
-        } catch (e) {
-            console.error("❌ Error grabando:", e);
-        }
-    });
+        console.log("🎤 Grabando VC...");
+    } catch (err) {
+        console.log("⚠️ Grabación desactivada (opus no disponible)");
+    }
 }
 
 // 💬 COMANDOS
@@ -181,6 +153,8 @@ client.on('messageCreate', async (msg) => {
     }
 
     if (cmd === 'play') {
+        if (!scReady) return msg.reply("⏳ Espera...");
+
         const query = args.join(' ');
         const vc = msg.member.voice.channel;
 
