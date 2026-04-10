@@ -1,8 +1,7 @@
-process.env.OPUS_SCRIPT = "1"; // 🔥 FORZAR OPUSSCRIPT
+process.env.OPUS_SCRIPT = "1";
 
 require('dotenv').config();
 const fs = require('fs');
-const { exec } = require('child_process');
 const prism = require('prism-media');
 
 const {
@@ -23,21 +22,8 @@ const {
 } = require('@discordjs/voice');
 
 const play = require('play-dl');
-const { createClient } = require('@supabase/supabase-js');
 
-let scReady = false;
-
-// ✅ SoundCloud FIX
-async function initSoundCloud() {
-    const client_id = await play.getFreeClientID();
-    await play.setToken({ soundcloud: { client_id } });
-    scReady = true;
-    console.log("✅ SoundCloud listo");
-}
-initSoundCloud();
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
+// ====== CLIENT ======
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -47,18 +33,35 @@ const client = new Client({
     ]
 });
 
+// ====== VARIABLES ======
 let queue = [];
 let player = createAudioPlayer();
 let connection = null;
 let currentChannel = null;
-let timeout = null;
+let autoplay = true;
 
-// READY
+// ====== FORMAT TIME ======
+function formatTime(ms) {
+    if (!ms) return "??:??";
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return `${min}:${sec.toString().padStart(2, '0')}`;
+}
+
+// ====== SOUNDCLOUD ======
+(async () => {
+    const client_id = await play.getFreeClientID();
+    await play.setToken({ soundcloud: { client_id } });
+    console.log("✅ SoundCloud listo");
+})();
+
+// ====== READY ======
 client.once('clientReady', () => {
     console.log(`✅ Bot listo como ${client.user.tag}`);
 });
 
-// 🎵 PLAY
+// ====== PLAY FUNCTION ======
 async function playMusic(channel) {
     if (!queue.length) return;
 
@@ -77,8 +80,16 @@ async function playMusic(channel) {
         connection.subscribe(player);
 
         const embed = new EmbedBuilder()
+            .setColor('#00ffcc')
             .setTitle('🎵 Reproduciendo')
-            .setDescription(song.title);
+            .setDescription(`**${song.title || "🎶 Desconocido"}**`)
+            .addFields(
+                { name: "⏱️ Duración", value: song.duration || "??:??", inline: true },
+                { name: "👤 Pedido por", value: song.user || "Desconocido", inline: true }
+            )
+            .setFooter({ text: `En cola: ${queue.length - 1}` });
+
+        if (song.thumbnail) embed.setThumbnail(song.thumbnail);
 
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('pause').setLabel('⏸️').setStyle(ButtonStyle.Primary),
@@ -89,18 +100,33 @@ async function playMusic(channel) {
         channel.send({ embeds: [embed], components: [row] });
 
     } catch (err) {
-        console.error("❌ Error reproduciendo:", err);
+        console.log("❌ Error:", err);
         queue.shift();
         playMusic(channel);
     }
 }
 
-player.on(AudioPlayerStatus.Idle, () => {
+// ====== AUTO NEXT ======
+player.on(AudioPlayerStatus.Idle, async () => {
     queue.shift();
+
+    if (!queue.length && autoplay) {
+        try {
+            const random = await play.search("lofi", { limit: 1 });
+            const t = random[0];
+
+            queue.push({
+                title: t.title || "Autoplay",
+                url: t.url,
+                duration: formatTime(t.durationInSec * 1000)
+            });
+        } catch { }
+    }
+
     playMusic(currentChannel);
 });
 
-// 🎤 GRABACIÓN SEGURA (NO CRASHEA)
+// ====== RECORD SAFE ======
 function startRecording(connection) {
     try {
         const receiver = connection.receiver;
@@ -112,52 +138,43 @@ function startRecording(connection) {
             }
         });
 
-        const file = `recording-${Date.now()}`;
-        const pcm = `./${file}.pcm`;
-
         const decoder = new prism.opus.Decoder({
             rate: 48000,
             channels: 2,
             frameSize: 960
         });
 
-        const writeStream = fs.createWriteStream(pcm);
-
-        opusStream.pipe(decoder).pipe(writeStream);
+        opusStream.pipe(decoder);
 
         console.log("🎤 Grabando VC...");
-    } catch (err) {
-        console.log("⚠️ Grabación desactivada (opus no disponible)");
+    } catch {
+        console.log("⚠️ Grabación desactivada");
     }
 }
 
-// 💬 COMANDOS
+// ====== COMMANDS ======
 client.on('messageCreate', async (msg) => {
     if (!msg.content.startsWith('-') || msg.author.bot) return;
 
     const args = msg.content.slice(1).split(' ');
     const cmd = args.shift().toLowerCase();
 
-    console.log("CMD:", cmd);
-
     if (cmd === 'help') {
         return msg.reply(`
-🎵 Comandos:
+🎵 **Comandos**
 -play <nombre/url>
 -pause
 -resume
 -skip
+-queue
+-autoplay
 -mov
--help
     `);
     }
 
     if (cmd === 'play') {
-        if (!scReady) return msg.reply("⏳ Espera...");
-
         const query = args.join(' ');
         const vc = msg.member.voice.channel;
-
         if (!vc) return msg.reply('❌ Entra a un VC');
 
         currentChannel = msg.channel;
@@ -180,9 +197,14 @@ client.on('messageCreate', async (msg) => {
 
         if (!result.length) return msg.reply("❌ No encontrado");
 
+        const track = result[0];
+
         queue.push({
-            title: result[0].title,
-            url: result[0].url
+            title: track.title || track.name || "🎶 Desconocido",
+            url: track.url,
+            duration: formatTime(track.durationInSec * 1000),
+            thumbnail: track.thumbnail?.url,
+            user: msg.author.username
         });
 
         msg.reply('✅ Añadido');
@@ -190,9 +212,24 @@ client.on('messageCreate', async (msg) => {
         if (queue.length === 1) playMusic(msg.channel);
     }
 
+    if (cmd === 'queue') {
+        if (!queue.length) return msg.reply("📭 Vacía");
+
+        const list = queue.map((s, i) =>
+            `${i === 0 ? "▶️" : `${i}.`} ${s.title}`
+        ).slice(0, 10).join('\n');
+
+        msg.reply(`📃 **Cola**\n${list}`);
+    }
+
     if (cmd === 'pause') player.pause();
     if (cmd === 'resume') player.unpause();
     if (cmd === 'skip') player.stop();
+
+    if (cmd === 'autoplay') {
+        autoplay = !autoplay;
+        msg.reply(`🔁 Autoplay: ${autoplay ? "ON" : "OFF"}`);
+    }
 
     if (cmd === 'mov') {
         const vc = msg.member.voice.channel;
@@ -211,7 +248,7 @@ client.on('messageCreate', async (msg) => {
     }
 });
 
-// 🔘 BOTONES
+// ====== BUTTONS ======
 client.on('interactionCreate', async (i) => {
     if (!i.isButton()) return;
 
@@ -222,7 +259,7 @@ client.on('interactionCreate', async (i) => {
     i.reply({ content: 'OK', ephemeral: true });
 });
 
-// 🔌 AUTO DESCONECTAR
+// ====== AUTO DISCONNECT ======
 setInterval(() => {
     if (!connection) return;
 
@@ -232,16 +269,13 @@ setInterval(() => {
     const humans = channel.members.filter(m => !m.user.bot);
 
     if (humans.size === 0) {
-        if (!timeout) {
-            timeout = setTimeout(() => {
+        setTimeout(() => {
+            if (connection) {
                 connection.destroy();
                 connection = null;
                 queue = [];
-            }, 10000);
-        }
-    } else {
-        clearTimeout(timeout);
-        timeout = null;
+            }
+        }, 10000);
     }
 }, 5000);
 
