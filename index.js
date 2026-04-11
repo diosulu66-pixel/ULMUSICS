@@ -657,7 +657,7 @@ client.on('interactionCreate', async (i) => {
 //  Ready
 // ─────────────────────────────────────────────
 
-client.once('ready', () => {
+client.once('clientReady', () => {
     console.log(`✅ Bot listo: ${client.user.tag}`);
     client.user.setActivity('🎵 -help', { type: 0 });
 });
