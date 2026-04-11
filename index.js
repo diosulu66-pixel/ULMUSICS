@@ -23,6 +23,7 @@ const {
     AudioPlayerStatus,
     VoiceConnectionStatus,
     EndBehaviorType,
+    StreamType,
     entersState
 } = require('@discordjs/voice');
 
@@ -461,10 +462,23 @@ async function playMusic(channel) {
             discordPlayerCompatibility: true
         });
 
-        const resource = createAudioResource(stream.stream, { inputType: stream.type });
+        // En Railway el stream Opus de play-dl no llega bien al pipeline de voz.
+        // Lo transcodificamos a PCM raw con ffmpeg y lo pasamos como StreamType.Raw
+        // para que @discordjs/voice lo re-encodee con opusscript correctamente.
+        const transcoded = ffmpeg(stream.stream)
+            .inputFormat(stream.type === 'opus' ? 'opus' : 'webm')
+            .audioFrequency(48000)
+            .audioChannels(2)
+            .audioCodec('pcm_s16le')
+            .format('s16le')
+            .on('error', (err) => console.error('❌ ffmpeg transcode error:', err.message))
+            .pipe();
+
+        const resource = createAudioResource(transcoded, {
+            inputType: StreamType.Raw,
+            inlineVolume: false
+        });
         player.play(resource);
-        // FIX #1: connection.subscribe ya fue llamado en connectToChannel, pero lo repetimos
-        // por si el player fue creado antes de conectar (no causa doble-suscripción, es idempotente)
         connection.subscribe(player);
 
         const embed = new EmbedBuilder()
