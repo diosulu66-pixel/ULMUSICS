@@ -320,51 +320,39 @@ async function connectToChannel(voiceChannel) {
             selfDeaf:       false
         });
 
-        // Reconexion automatica si se cae brevemente
-        connection.on(VoiceConnectionStatus.Disconnected, async () => {
-            try {
-                await Promise.race([
-                    entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-                    entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-                ]);
-            } catch {
-                try { connection.destroy(); } catch {}
-            }
-        });
-
         connection.on(VoiceConnectionStatus.Destroyed, () => {
             connection = null;
             queue = [];
             stopAllRecordings();
         });
 
-        // Reintentar hasta 3 veces con 20s cada uno
-        let ready = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-                ready = true;
-                break;
-            } catch {
-                console.log(`Intento ${attempt}/3 fallido, reintentando...`);
-                await new Promise(r => setTimeout(r, 2_000));
-            }
-        }
+        // Esperar Ready via evento, sin entersState que falla en Railway
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('timeout')), 30_000);
 
-        if (!ready) {
-            console.error('No se pudo conectar despues de 3 intentos');
-            try { connection.destroy(); } catch {}
-            connection = null;
-            return false;
-        }
+            // Si ya está Ready (conexión instantánea)
+            if (connection.state.status === VoiceConnectionStatus.Ready) {
+                clearTimeout(timeout);
+                return resolve();
+            }
+
+            connection.once(VoiceConnectionStatus.Ready, () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+
+            connection.once(VoiceConnectionStatus.Destroyed, () => {
+                clearTimeout(timeout);
+                reject(new Error('destroyed'));
+            });
+        });
 
         startRecording(connection, voiceChannel.guild.id);
-        // Suscribir player al connection siempre al conectar
         connection.subscribe(player);
-        console.log(`Conectado a: ${voiceChannel.name}`);
+        console.log(`✅ Conectado a: ${voiceChannel.name}`);
         return true;
     } catch (err) {
-        console.error('Error conectando:', err.message);
+        console.error('❌ Error conectando:', err.message);
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         return false;
     }
