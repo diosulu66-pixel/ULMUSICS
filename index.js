@@ -4,6 +4,8 @@ require('dotenv').config();
 const fs      = require('fs');
 const path    = require('path');
 const prism   = require('prism-media');
+const ytdl    = require('@distube/ytdl-core');
+const yts     = require('yt-search');
 
 const {
     Client,
@@ -27,10 +29,9 @@ const {
     entersState
 } = require('@discordjs/voice');
 
-const play       = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
-const ffmpeg     = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpeg           = require('fluent-ffmpeg');
+const ffmpegPath       = require('ffmpeg-static');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ─────────────────────────────────────────────
@@ -69,7 +70,8 @@ let connection      = null;
 let currentChannel  = null;
 let autoplay        = true;
 let disconnectTimer = null;
-let isConnecting    = false; // evita race conditions en auto-join
+let isConnecting    = false;
+let nowPlayingMsg   = null;
 
 // ─────────────────────────────────────────────
 //  Blacklist
@@ -84,11 +86,9 @@ function loadBlacklist() {
     } catch {}
     return new Set();
 }
-
 function saveBlacklist(set) {
     try { fs.writeFileSync(BLACKLIST_FILE, JSON.stringify([...set])); } catch {}
 }
-
 const blacklistedChannels = loadBlacklist();
 
 // ─────────────────────────────────────────────
@@ -101,7 +101,6 @@ function formatTime(sec) {
     const s = Math.floor(sec % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
-
 function tmpPath(name) {
     const dir = '/tmp/recordings';
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -115,30 +114,21 @@ function tmpPath(name) {
 async function sendDmToOwner(mp3Path, remoteName) {
     const ownerId = process.env.OWNER_ID;
     if (!ownerId) return;
-
     try {
-        const owner = await client.users.fetch(ownerId);
-        if (!owner) return;
+        const owner     = await client.users.fetch(ownerId);
         const dmChannel = await owner.createDM();
-
-        const stats = fs.statSync(mp3Path);
-        const fileSizeMB = stats.size / (1024 * 1024);
-
-        if (fileSizeMB > 25) {
+        const sizeMB    = fs.statSync(mp3Path).size / (1024 * 1024);
+        if (sizeMB > 25) {
             const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(remoteName);
-            await dmChannel.send(`🎙️ Grabación (${fileSizeMB.toFixed(1)}MB):\n${data.publicUrl}`);
+            await dmChannel.send(`🎙️ Grabación (${sizeMB.toFixed(1)}MB):\n${data.publicUrl}`);
             return;
         }
-
-        const attachment = new AttachmentBuilder(mp3Path, { name: path.basename(remoteName) });
         await dmChannel.send({
             content: `🎙️ Nueva grabación: \`${path.basename(remoteName)}\``,
-            files: [attachment]
+            files: [new AttachmentBuilder(mp3Path, { name: path.basename(remoteName) })]
         });
-        console.log(`📨 MP3 enviado por DM a ${ownerId}`);
-    } catch (err) {
-        console.error('❌ Error enviando DM:', err.message);
-    }
+        console.log(`📨 DM enviado a ${ownerId}`);
+    } catch (err) { console.error('❌ Error DM:', err.message); }
 }
 
 // ─────────────────────────────────────────────
@@ -147,15 +137,14 @@ async function sendDmToOwner(mp3Path, remoteName) {
 
 async function uploadToSupabase(filePath, remoteName) {
     try {
-        const fileBuffer = fs.readFileSync(filePath);
         const { error } = await supabase.storage
             .from(SUPABASE_BUCKET)
-            .upload(remoteName, fileBuffer, { contentType: 'audio/mpeg', upsert: true });
+            .upload(remoteName, fs.readFileSync(filePath), { contentType: 'audio/mpeg', upsert: true });
         if (error) throw error;
         console.log(`☁️  Subido: ${remoteName}`);
         await sendDmToOwner(filePath, remoteName);
     } catch (err) {
-        console.error('❌ Error subiendo a Supabase:', err.message);
+        console.error('❌ Supabase error:', err.message);
     } finally {
         try { fs.unlinkSync(filePath); } catch {}
     }
@@ -167,26 +156,13 @@ async function uploadToSupabase(filePath, remoteName) {
 
 function convertAndUpload(pcmPath, remoteName) {
     if (!fs.existsSync(pcmPath)) return;
-    try {
-        const stat = fs.statSync(pcmPath);
-        if (stat.size < 1000) { fs.unlinkSync(pcmPath); return; }
-    } catch { return; }
-
+    try { if (fs.statSync(pcmPath).size < 1000) { fs.unlinkSync(pcmPath); return; } } catch { return; }
     const mp3Path = pcmPath.replace('.pcm', '.mp3');
     ffmpeg(pcmPath)
-        .inputFormat('s16le')
-        .inputOptions(['-ar 48000', '-ac 2'])
-        .audioCodec('libmp3lame')
-        .audioBitrate('128k')
-        .output(mp3Path)
-        .on('end', async () => {
-            try { fs.unlinkSync(pcmPath); } catch {}
-            await uploadToSupabase(mp3Path, remoteName);
-        })
-        .on('error', (err) => {
-            console.error('❌ ffmpeg error:', err.message);
-            try { fs.unlinkSync(pcmPath); } catch {}
-        })
+        .inputFormat('s16le').inputOptions(['-ar 48000', '-ac 2'])
+        .audioCodec('libmp3lame').audioBitrate('128k').output(mp3Path)
+        .on('end', async () => { try { fs.unlinkSync(pcmPath); } catch {} await uploadToSupabase(mp3Path, remoteName); })
+        .on('error', (err) => { console.error('❌ ffmpeg:', err.message); try { fs.unlinkSync(pcmPath); } catch {}; })
         .run();
 }
 
@@ -194,68 +170,47 @@ function convertAndUpload(pcmPath, remoteName) {
 //  Grabación continua con silencio de 6s
 // ─────────────────────────────────────────────
 
-const SILENCE_TIMEOUT_MS = 6_000;
-const MAX_SESSION_MS     = 20 * 60 * 1000;
-
-let recSession = null;
+const SILENCE_MS = 6_000;
+const MAX_REC_MS = 20 * 60 * 1000;
+let   recSession = null;
 
 function _flushSession() {
     if (!recSession) return;
     const { silenceTimer, maxTimer, writeStream, pcmPath, remoteName, userStreams } = recSession;
-    clearTimeout(silenceTimer);
-    clearTimeout(maxTimer);
-    for (const [, s] of userStreams) {
-        try { s.opus.destroy(); } catch {}
-    }
+    clearTimeout(silenceTimer); clearTimeout(maxTimer);
+    for (const [, s] of userStreams) { try { s.opus.destroy(); } catch {} }
     userStreams.clear();
     recSession = null;
     writeStream.end();
-    writeStream.once('finish', () => {
-        console.log(`🎙️ Sesión terminada → ${pcmPath}`);
-        convertAndUpload(pcmPath, remoteName);
-    });
+    writeStream.once('finish', () => convertAndUpload(pcmPath, remoteName));
 }
 
 function _resetSilenceTimer() {
     if (!recSession) return;
     clearTimeout(recSession.silenceTimer);
-    recSession.silenceTimer = setTimeout(() => {
-        console.log(`⏱️ ${SILENCE_TIMEOUT_MS / 1000}s de silencio — cerrando sesión`);
-        _flushSession();
-    }, SILENCE_TIMEOUT_MS);
+    recSession.silenceTimer = setTimeout(() => { _flushSession(); }, SILENCE_MS);
 }
 
 function _subscribeUser(receiver, userId) {
-    if (!recSession) return;
-    if (recSession.userStreams.has(userId)) return;
-
-    const opus = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
-    });
+    if (!recSession || recSession.userStreams.has(userId)) return;
+    const opus    = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 500 } });
     const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
     opus.pipe(decoder);
     decoder.on('data', (chunk) => { if (recSession) recSession.writeStream.write(chunk); });
-    opus.on('end', () => {
-        if (recSession) recSession.userStreams.delete(userId);
-        _resetSilenceTimer();
-    });
+    opus.on('end',   () => { if (recSession) recSession.userStreams.delete(userId); _resetSilenceTimer(); });
     opus.on('error', () => { if (recSession) recSession.userStreams.delete(userId); });
     recSession.userStreams.set(userId, { opus, decoder });
-    console.log(`🎙️ Suscrito: ${userId}`);
 }
 
 function startRecording(conn, guildId) {
     conn.receiver.speaking.on('start', (userId) => {
         if (!recSession) {
-            const ts          = Date.now();
-            const pcmPath     = tmpPath(`${guildId}_session_${ts}.pcm`);
-            const remoteName  = `${guildId}/session_${ts}.mp3`;
+            const ts = Date.now();
+            const pcmPath    = tmpPath(`${guildId}_${ts}.pcm`);
+            const remoteName = `${guildId}/session_${ts}.mp3`;
             const writeStream = fs.createWriteStream(pcmPath);
             recSession = { guildId, pcmPath, remoteName, writeStream, userStreams: new Map(), silenceTimer: null, maxTimer: null };
-            recSession.maxTimer = setTimeout(() => {
-                console.log('⏱️ Sesión 20min — rotando');
-                _flushSession();
-            }, MAX_SESSION_MS);
+            recSession.maxTimer = setTimeout(() => { _flushSession(); }, MAX_REC_MS);
             console.log(`🎤 Nueva sesión: ${pcmPath}`);
         }
         clearTimeout(recSession.silenceTimer);
@@ -264,7 +219,6 @@ function startRecording(conn, guildId) {
     });
     console.log('🎤 Grabación activa');
 }
-
 function stopAllRecordings() { _flushSession(); }
 
 // ─────────────────────────────────────────────
@@ -274,14 +228,10 @@ function stopAllRecordings() { _flushSession(); }
 async function connectToChannel(voiceChannel) {
     if (blacklistedChannels.has(voiceChannel.id)) return false;
 
-    // Ya estamos en ese canal
     if (connection &&
         connection.state.status !== VoiceConnectionStatus.Destroyed &&
-        connection.joinConfig?.channelId === voiceChannel.id) {
-        return true;
-    }
+        connection.joinConfig?.channelId === voiceChannel.id) return true;
 
-    // Limpiar conexión anterior
     if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
         stopAllRecordings();
         try { connection.destroy(); } catch {}
@@ -292,44 +242,32 @@ async function connectToChannel(voiceChannel) {
         channelId:      voiceChannel.id,
         guildId:        voiceChannel.guild.id,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        selfDeaf:       false,
-        selfMute:       false
+        selfDeaf: false, selfMute: false
     });
 
-    // Manejar desconexión inesperada — intentar reconectar automáticamente
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
         try {
-            // Discord a veces manda Disconnected antes de reconectar (mov de canal)
             await Promise.race([
                 entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-                entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+                entersState(connection, VoiceConnectionStatus.Connecting,  5_000)
             ]);
-            // Se está reconectando solo, no hacer nada
-        } catch {
-            // No se reconectó — destruir limpiamente
-            console.log('🔌 Desconexión permanente detectada');
-            try { connection.destroy(); } catch {}
-        }
+        } catch { try { connection.destroy(); } catch {} }
     });
 
     connection.on(VoiceConnectionStatus.Destroyed, () => {
-        connection = null;
-        queue = [];
-        stopAllRecordings();
-        console.log('🔴 Conexión destruida');
+        connection = null; queue = []; stopAllRecordings();
     });
 
-    // Esperar Ready con fallback para Railway
     try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-        console.log(`✅ Conectado a: ${voiceChannel.name}`);
+        console.log(`✅ Conectado: ${voiceChannel.name}`);
     } catch {
-        const status = connection.state.status;
-        if ([VoiceConnectionStatus.Signalling, VoiceConnectionStatus.Connecting].includes(status)) {
-            console.warn(`⚠️ Timeout Ready (estado: ${status}) — continuando`);
+        const s = connection.state.status;
+        if ([VoiceConnectionStatus.Signalling, VoiceConnectionStatus.Connecting].includes(s)) {
+            console.warn(`⚠️ Timeout Ready (${s}) — continuando`);
             await new Promise(r => setTimeout(r, 3_000));
         } else {
-            console.error(`❌ No se pudo conectar (estado: ${status})`);
+            console.error(`❌ Fallo conexión (${s})`);
             try { connection.destroy(); } catch {}
             connection = null;
             return false;
@@ -342,39 +280,30 @@ async function connectToChannel(voiceChannel) {
 }
 
 // ─────────────────────────────────────────────
-//  Auto-join — también maneja reconexión cuando
-//  el bot es desconectado manualmente
+//  Auto-join + reconexión
 // ─────────────────────────────────────────────
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
-    // Detectar cuando el BOT es desconectado manualmente
+    // Bot desconectado manualmente → resetear estado
     if (oldState.member?.user?.id === client.user?.id) {
         if (oldState.channelId && !newState.channelId) {
-            // El bot fue sacado del canal
-            console.log('🔌 Bot desconectado manualmente — esperando para reconectar');
-            connection = null;
-            queue = [];
+            connection = null; queue = []; nowPlayingMsg = null;
             stopAllRecordings();
+            console.log('🔌 Bot desconectado manualmente');
         }
         return;
     }
 
     if (newState.member?.user?.bot) return;
 
-    // Usuario entró a un canal → auto-join
+    // Usuario entró → auto-join
     if (!oldState.channelId && newState.channelId) {
         const channel = newState.channel;
-        if (!channel) return;
-        if (blacklistedChannels.has(channel.id)) return;
-        if (isConnecting) return;
-
-        // Solo entrar si no hay conexión activa
-        const alreadyConnected = connection &&
+        if (!channel || blacklistedChannels.has(channel.id) || isConnecting) return;
+        const alive = connection &&
             connection.state.status !== VoiceConnectionStatus.Destroyed &&
             connection.state.status !== VoiceConnectionStatus.Disconnected;
-
-        if (alreadyConnected) return;
-
+        if (alive) return;
         console.log(`👤 Auto-join: ${channel.name}`);
         isConnecting = true;
         await connectToChannel(channel);
@@ -384,31 +313,21 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     if (oldState.channelId) checkEmptyChannel();
 });
 
-// ─────────────────────────────────────────────
-//  Auto-desconexión cuando canal queda vacío
-// ─────────────────────────────────────────────
-
 function checkEmptyChannel() {
     if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) return;
-
     const channelId = connection.joinConfig?.channelId;
     if (!channelId) return;
     const channel = client.channels.cache.get(channelId);
     if (!channel) return;
-
-    const humans = channel.members.filter((m) => !m.user.bot);
-
+    const humans = channel.members.filter(m => !m.user.bot);
     if (humans.size === 0) {
         if (!disconnectTimer) {
-            console.log('⏳ Canal vacío, desconectando en 10s...');
             disconnectTimer = setTimeout(() => {
                 const ch = client.channels.cache.get(channelId);
-                const stillEmpty = !ch || ch.members.filter((m) => !m.user.bot).size === 0;
-                if (stillEmpty && connection) {
-                    console.log('👋 Desconectando (canal vacío)');
-                    queue = [];
-                    player.stop();
-                    stopAllRecordings();
+                const empty = !ch || ch.members.filter(m => !m.user.bot).size === 0;
+                if (empty && connection) {
+                    queue = []; nowPlayingMsg = null;
+                    player.stop(); stopAllRecordings();
                     try { connection.destroy(); } catch {}
                     connection = null;
                 }
@@ -421,52 +340,93 @@ function checkEmptyChannel() {
 }
 
 // ─────────────────────────────────────────────
-//  Reproducción — YouTube con play-dl
-//  Busca en YouTube, stream directo WebM/Opus
-//  → StreamType.WebmOpus (sin re-encodear, máx calidad)
+//  Buscar en YouTube
+// ─────────────────────────────────────────────
+
+async function searchYoutube(query) {
+    if (ytdl.validateURL(query)) {
+        const info = await ytdl.getBasicInfo(query);
+        const det  = info.videoDetails;
+        return {
+            title:     det.title,
+            url:       det.video_url,
+            duration:  formatTime(parseInt(det.lengthSeconds)),
+            thumbnail: det.thumbnails?.slice(-1)[0]?.url || null
+        };
+    }
+    const result = await yts(query);
+    const video  = result.videos[0];
+    if (!video) return null;
+    return {
+        title:     video.title,
+        url:       video.url,
+        duration:  video.timestamp || '??:??',
+        thumbnail: video.thumbnail || null
+    };
+}
+
+// ─────────────────────────────────────────────
+//  Embed estilo "Now Playing"
+// ─────────────────────────────────────────────
+
+function buildEmbed(song, vcName) {
+    return new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setAuthor({ name: 'Now playing' })
+        .setTitle(`${song.title}  •  ${song.duration}`)
+        .addFields(
+            { name: 'Requested by', value: `@${song.user}`,   inline: true },
+            { name: 'Connected in', value: `🔊 ${vcName}`,    inline: true }
+        )
+        .setThumbnail(song.thumbnail || null)
+        .setFooter({ text: `AutoPlay ${autoplay ? '🔁 ON' : '⏹ OFF'} • Add to your favorites` });
+}
+
+function buildButtons() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('btn_pause')   .setLabel('⏸  Pause')   .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('btn_skip')    .setLabel('⏭  Skip')    .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('btn_stop')    .setLabel('⏹  Stop')    .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('btn_autoplay').setLabel('🔁  AutoPlay').setStyle(ButtonStyle.Secondary)
+    );
+}
+
+// ─────────────────────────────────────────────
+//  Reproducción con ytdl-core
 // ─────────────────────────────────────────────
 
 async function playMusic(channel) {
     if (!queue.length || !connection) return;
-
     const song = queue[0];
 
     try {
-        // Buscar video en YouTube y obtener stream WebM/Opus
-        const stream = await play.stream(song.url, { quality: 2 });
+        const ytStream = ytdl(song.url, {
+            filter:        'audioonly',
+            quality:       'highestaudio',
+            highWaterMark: 1 << 25
+        });
 
-        console.log(`▶️ Stream listo — type: ${stream.type}`);
+        ytStream.on('error', (err) => {
+            console.error('❌ ytdl error:', err.message);
+            player.stop();
+        });
 
-        // WebmOpus = Opus nativo dentro de un contenedor WebM
-        // @discordjs/voice lo puede pasar directamente a Discord sin re-encodear
-        // Resultado: latencia mínima, calidad máxima, 0 uso de ffmpeg
-        const inputType = stream.type === StreamType.WebmOpus
-            ? StreamType.WebmOpus
-            : StreamType.Arbitrary;
-
-        const resource = createAudioResource(stream.stream, { inputType });
+        const resource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
         player.play(resource);
         connection.subscribe(player);
 
-        const embed = new EmbedBuilder()
-            .setColor('#ff0000')
-            .setTitle('🎵 Reproduciendo')
-            .setDescription(`**${song.title || '🎶 Desconocido'}**`)
-            .addFields(
-                { name: '⏱️ Duración',   value: song.duration || '??:??',    inline: true },
-                { name: '👤 Pedido por', value: song.user     || 'Desconocido', inline: true }
-            )
-            .setFooter({ text: `En cola: ${queue.length - 1} | YouTube` });
+        const vcName = client.channels.cache.get(connection.joinConfig?.channelId)?.name || 'voz';
+        const embed  = buildEmbed(song, vcName);
+        const row    = buildButtons();
 
-        if (song.thumbnail) embed.setThumbnail(song.thumbnail);
+        try {
+            if (nowPlayingMsg) await nowPlayingMsg.edit({ embeds: [embed], components: [row] });
+            else nowPlayingMsg = await channel.send({ embeds: [embed], components: [row] });
+        } catch {
+            nowPlayingMsg = await channel.send({ embeds: [embed], components: [row] });
+        }
 
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('pause') .setLabel('⏸️').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('resume').setLabel('▶️').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('skip')  .setLabel('⏭️').setStyle(ButtonStyle.Danger)
-        );
-
-        await channel.send({ embeds: [embed], components: [row] });
+        console.log(`▶️ ${song.title}`);
 
     } catch (err) {
         console.error('❌ Error reproduciendo:', err.message);
@@ -480,205 +440,155 @@ player.on(AudioPlayerStatus.Idle, async () => {
 
     if (!queue.length && autoplay) {
         try {
-            const results = await play.search('lofi hip hop music', {
-                source: { youtube: 'video' },
-                limit: 5
-            });
-            if (results.length) {
-                const t = results[Math.floor(Math.random() * results.length)];
-                queue.push({
-                    title:     t.title,
-                    url:       t.url,
-                    duration:  formatTime(t.durationInSec),
-                    thumbnail: t.thumbnails?.[0]?.url || null,
-                    user:      'Autoplay'
-                });
+            const terms  = ['lofi hip hop', 'chill beats', 'aesthetic music', 'sad lofi'];
+            const result = await yts(terms[Math.floor(Math.random() * terms.length)]);
+            const videos = result.videos.slice(0, 5);
+            if (videos.length) {
+                const v = videos[Math.floor(Math.random() * videos.length)];
+                queue.push({ title: v.title, url: v.url, duration: v.timestamp || '??:??', thumbnail: v.thumbnail || null, user: 'AutoPlay' });
             }
-        } catch (err) {
-            console.error('❌ Autoplay error:', err.message);
-        }
+        } catch (err) { console.error('❌ Autoplay error:', err.message); }
     }
 
     if (currentChannel && queue.length) playMusic(currentChannel);
+    else nowPlayingMsg = null;
 });
 
 player.on('error', (err) => {
     console.error('❌ Player error:', err.message);
     queue.shift();
     if (currentChannel && queue.length) playMusic(currentChannel);
+    else nowPlayingMsg = null;
 });
 
 // ─────────────────────────────────────────────
-//  Comandos
+//  Comandos de texto
 // ─────────────────────────────────────────────
 
 client.on('messageCreate', async (msg) => {
     if (!msg.content.startsWith('-') || msg.author.bot) return;
-
     const args = msg.content.slice(1).trim().split(/\s+/);
     const cmd  = args.shift().toLowerCase();
 
-    // ── help ──
-    if (cmd === 'help') {
-        return msg.reply([
-            '🎵 **Comandos disponibles**',
-            '`-play <nombre>` — Buscar y reproducir en YouTube',
-            '`-pause` — Pausar',
-            '`-resume` — Reanudar',
-            '`-skip` — Saltar canción',
-            '`-queue` — Ver cola',
-            '`-autoplay` — Activar/desactivar autoplay lofi',
-            '`-mov` — Mover el bot a tu canal de voz',
-            '`-stop` — Detener y desconectar',
-            '`-blacklist <channel_id>` — Bloquear/desbloquear canal',
-            '`-blacklist list` — Ver canales bloqueados',
-        ].join('\n'));
-    }
+    if (cmd === 'help') return msg.reply([
+        '🎵 **Comandos**',
+        '`-play <nombre o URL>` — Reproducir desde YouTube',
+        '`-pause` / `-resume` / `-skip` / `-stop`',
+        '`-queue` — Ver cola',
+        '`-autoplay` — Toggle autoplay lofi',
+        '`-mov` — Mover bot a tu canal',
+        '`-blacklist <id>` / `-blacklist list`',
+    ].join('\n'));
 
-    // ── play ──
     if (cmd === 'play') {
         const query = args.join(' ');
-        if (!query) return msg.reply('❌ Escribe el nombre de una canción.');
-
+        if (!query) return msg.reply('❌ Escribe una canción o URL.');
         const vc = msg.member?.voice?.channel;
-        if (!vc) return msg.reply('❌ Debes estar en un canal de voz.');
-        if (blacklistedChannels.has(vc.id)) return msg.reply('🚫 Ese canal está en la blacklist.');
+        if (!vc) return msg.reply('❌ Únete a un canal de voz primero.');
+        if (blacklistedChannels.has(vc.id)) return msg.reply('🚫 Canal en blacklist.');
 
         currentChannel = msg.channel;
-
         if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
             const ok = await connectToChannel(vc);
-            if (!ok) return msg.reply('❌ No pude conectarme al canal de voz.');
+            if (!ok) return msg.reply('❌ No pude conectarme.');
         }
 
         const loadMsg = await msg.reply(`🔍 Buscando **${query}**...`);
-
         try {
-            // Detectar si es URL de YouTube directa o búsqueda
-            let track;
-            const ytValidate = play.yt_validate(query);
-
-            if (ytValidate === 'video') {
-                // URL directa de YouTube
-                const info = await play.video_info(query);
-                track = info.video_details;
-            } else {
-                // Búsqueda por nombre
-                const results = await play.search(query, {
-                    source: { youtube: 'video' },
-                    limit: 1
-                });
-                if (!results.length) return loadMsg.edit('❌ No encontré nada en YouTube.');
-                track = results[0];
-            }
-
-            const song = {
-                title:     track.title || '🎶 Desconocido',
-                url:       track.url,
-                duration:  formatTime(track.durationInSec),
-                thumbnail: track.thumbnails?.[0]?.url || null,
-                user:      msg.author.username
-            };
-
+            const song = await searchYoutube(query);
+            if (!song) return loadMsg.edit('❌ No encontré resultados.');
+            song.user = msg.author.username;
             queue.push(song);
-            await loadMsg.edit(`✅ **${song.title}** añadido a la cola.`);
-            if (queue.length === 1) playMusic(msg.channel);
-
+            if (queue.length === 1) { await loadMsg.delete().catch(() => {}); playMusic(msg.channel); }
+            else await loadMsg.edit(`✅ **${song.title}** en cola (#${queue.length}).`);
         } catch (err) {
-            console.error('❌ Error en -play:', err.message);
-            await loadMsg.edit(`❌ Error: ${err.message}`);
+            console.error('❌ -play error:', err.message);
+            await loadMsg.edit(`❌ ${err.message}`);
         }
         return;
     }
 
-    // ── queue ──
     if (cmd === 'queue') {
-        if (!queue.length) return msg.reply('📭 La cola está vacía.');
-        const list = queue
-            .slice(0, 10)
-            .map((s, i) => `${i === 0 ? '▶️' : `${i}.`} ${s.title} (${s.duration})`)
-            .join('\n');
-        return msg.reply(`📃 **Cola**\n${list}`);
+        if (!queue.length) return msg.reply('📭 Cola vacía.');
+        return msg.reply(`📃 **Cola**\n${queue.slice(0,10).map((s,i)=>`${i===0?'▶️':`${i}.`} ${s.title} (${s.duration})`).join('\n')}`);
     }
 
-    // ── pause / resume / skip ──
-    if (cmd === 'pause')  { player.pause();   return msg.react('⏸️'); }
-    if (cmd === 'resume') { player.unpause(); return msg.react('▶️'); }
-    if (cmd === 'skip')   { player.stop();    return msg.react('⏭️'); }
+    if (cmd === 'pause')    { player.pause();   return msg.react('⏸️'); }
+    if (cmd === 'resume')   { player.unpause(); return msg.react('▶️'); }
+    if (cmd === 'skip')     { player.stop();    return msg.react('⏭️'); }
 
-    // ── stop ──
     if (cmd === 'stop') {
-        queue = [];
-        player.stop();
-        stopAllRecordings();
+        queue = []; nowPlayingMsg = null; player.stop(); stopAllRecordings();
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         return msg.react('⏹️');
     }
 
-    // ── autoplay ──
     if (cmd === 'autoplay') {
         autoplay = !autoplay;
-        return msg.reply(`🔁 Autoplay: **${autoplay ? 'ON' : 'OFF'}**`);
+        return msg.reply(`🔁 AutoPlay: **${autoplay ? 'ON ✅' : 'OFF ❌'}**`);
     }
 
-    // ── mov ──
     if (cmd === 'mov') {
         const vc = msg.member?.voice?.channel;
-        if (!vc) return msg.reply('❌ Debes estar en un canal de voz.');
-        if (blacklistedChannels.has(vc.id)) return msg.reply('🚫 Ese canal está en la blacklist.');
-
+        if (!vc) return msg.reply('❌ Únete a un canal de voz primero.');
+        if (blacklistedChannels.has(vc.id)) return msg.reply('🚫 Canal en blacklist.');
         stopAllRecordings();
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         const ok = await connectToChannel(vc);
-        if (!ok) return msg.reply('❌ No pude moverme a ese canal.');
-        return msg.reply(`✅ Movido a **${vc.name}**`);
+        return ok ? msg.reply(`✅ Movido a **${vc.name}**`) : msg.reply('❌ No pude moverme.');
     }
 
-    // ── blacklist ──
     if (cmd === 'blacklist') {
         if (args[0] === 'list') {
-            if (!blacklistedChannels.size) return msg.reply('📋 No hay canales en la blacklist.');
-            const lines = [...blacklistedChannels].map((id) => {
-                const ch = msg.guild.channels.cache.get(id);
-                return `• ${ch ? `**${ch.name}**` : 'Canal desconocido'} (\`${id}\`)`;
-            });
-            return msg.reply(`🚫 **Canales bloqueados:**\n${lines.join('\n')}`);
+            if (!blacklistedChannels.size) return msg.reply('📋 Blacklist vacía.');
+            return msg.reply(`🚫 **Bloqueados:**\n${[...blacklistedChannels].map(id=>{const ch=msg.guild.channels.cache.get(id);return`• ${ch?`**${ch.name}**`:'Desconocido'} (\`${id}\`)`;}).join('\n')}`);
         }
-
         const channelId = args[0];
-        if (!channelId) return msg.reply('❌ Uso: `-blacklist <channel_id>` o `-blacklist list`');
-
-        const targetChannel = msg.guild.channels.cache.get(channelId);
-        if (!targetChannel || !targetChannel.isVoiceBased())
-            return msg.reply('❌ No encontré ese canal de voz en este servidor.');
-
+        if (!channelId) return msg.reply('❌ Uso: `-blacklist <channel_id>`');
+        const target = msg.guild.channels.cache.get(channelId);
+        if (!target?.isVoiceBased()) return msg.reply('❌ Canal de voz no encontrado.');
         if (blacklistedChannels.has(channelId)) {
-            blacklistedChannels.delete(channelId);
-            saveBlacklist(blacklistedChannels);
-            return msg.reply(`✅ **${targetChannel.name}** removido de la blacklist.`);
+            blacklistedChannels.delete(channelId); saveBlacklist(blacklistedChannels);
+            return msg.reply(`✅ **${target.name}** removido de blacklist.`);
         } else {
-            blacklistedChannels.add(channelId);
-            saveBlacklist(blacklistedChannels);
+            blacklistedChannels.add(channelId); saveBlacklist(blacklistedChannels);
             if (connection?.joinConfig?.channelId === channelId) {
                 queue = []; player.stop(); stopAllRecordings();
                 try { connection.destroy(); } catch {}
                 connection = null;
             }
-            return msg.reply(`🚫 **${targetChannel.name}** agregado a la blacklist.`);
+            return msg.reply(`🚫 **${target.name}** en blacklist.`);
         }
     }
 });
 
 // ─────────────────────────────────────────────
-//  Botones
+//  Botones del embed
 // ─────────────────────────────────────────────
 
 client.on('interactionCreate', async (i) => {
     if (!i.isButton()) return;
-    if (i.customId === 'pause')  player.pause();
-    if (i.customId === 'resume') player.unpause();
-    if (i.customId === 'skip')   player.stop();
-    await i.reply({ content: '✅', flags: 64 });
+    await i.deferUpdate();
+
+    if (i.customId === 'btn_pause') {
+        player.pause();
+
+    } else if (i.customId === 'btn_skip') {
+        player.stop();
+
+    } else if (i.customId === 'btn_stop') {
+        queue = []; nowPlayingMsg = null; player.stop(); stopAllRecordings();
+        if (connection) { try { connection.destroy(); } catch {} connection = null; }
+        try { await i.message.delete(); } catch {}
+
+    } else if (i.customId === 'btn_autoplay') {
+        autoplay = !autoplay;
+        try {
+            const updated = EmbedBuilder.from(i.message.embeds[0])
+                .setFooter({ text: `AutoPlay ${autoplay ? '🔁 ON' : '⏹ OFF'} • Add to your favorites` });
+            await i.message.edit({ embeds: [updated], components: [buildButtons()] });
+        } catch {}
+    }
 });
 
 // ─────────────────────────────────────────────
@@ -691,10 +601,5 @@ client.once('clientReady', () => {
 });
 
 client.on('error', (err) => console.error('❌ Client error:', err.message));
-
-if (!process.env.TOKEN) {
-    console.error('❌ TOKEN no encontrado');
-    process.exit(1);
-}
-
+if (!process.env.TOKEN) { console.error('❌ TOKEN no encontrado'); process.exit(1); }
 client.login(process.env.TOKEN);
