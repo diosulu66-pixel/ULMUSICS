@@ -31,7 +31,7 @@ const play       = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
 const ffmpeg     = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-const { spawn }  = require('child_process');
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ─────────────────────────────────────────────
@@ -491,37 +491,16 @@ async function playMusic(channel) {
         await play.setToken({ soundcloud: { client_id: cid } });
 
         const scStream = await play.stream(song.url);
-        console.log(`🎵 Stream type: ${scStream.type}`);
+        console.log(`🎵 Stream type: ${scStream.type}, stream: ${scStream.stream.constructor.name}`);
 
-        // Usamos spawn directo de ffmpeg con stdin/stdout para máxima compatibilidad
-        // fluent-ffmpeg().pipe() no emite datos correctamente en Railway
-        const ffmpegProc = spawn(ffmpegPath, [
-            '-i', 'pipe:0',          // leer desde stdin
-            '-f', 's16le',           // formato PCM raw
-            '-ar', '48000',          // sample rate 48kHz
-            '-ac', '2',              // stereo
-            '-acodec', 'pcm_s16le',
-            'pipe:1'                 // escribir a stdout
-        ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-        // Conectar el stream de SoundCloud al stdin de ffmpeg
-        scStream.stream.pipe(ffmpegProc.stdin);
-
-        ffmpegProc.stderr.on('data', (d) => {
-            const msg = d.toString();
-            if (msg.includes('Error') || msg.includes('Invalid')) {
-                console.error('❌ ffmpeg stderr:', msg.trim());
-            }
-        });
-
-        ffmpegProc.on('spawn',  ()    => console.log('🎬 ffmpeg spawned'));
-        ffmpegProc.on('error',  (err) => console.error('❌ ffmpeg spawn error:', err.message));
-        ffmpegProc.on('close',  (code)=> console.log(`🎬 ffmpeg cerrado con código ${code}`));
-
-        const resource = createAudioResource(ffmpegProc.stdout, {
-            inputType: StreamType.Raw,
+        // El SoundCloudStream de play-dl es un Readable que entrega audio HLS segmentado.
+        // createAudioResource con StreamType.Arbitrary lo acepta directamente —
+        // @discordjs/voice usa ffmpeg internamente para transcodificar a Opus.
+        const resource = createAudioResource(scStream.stream, {
+            inputType: StreamType.Arbitrary,
             inlineVolume: false
         });
+
         player.play(resource);
         connection.subscribe(player);
 
