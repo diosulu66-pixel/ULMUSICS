@@ -51,13 +51,14 @@ const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'recordings';
 const COOKIES_PATH = '/tmp/yt_cookies.txt';
 
 function setupCookies() {
-    const cookieData = process.env.YOUTUBE_COOKIES;
+    const cookieData = process.env.YOUTUBE_COOKIES_B64;
     if (!cookieData) {
-        console.warn('⚠️  YOUTUBE_COOKIES no definida — yt-dlp puede ser bloqueado por YouTube');
+        console.warn('⚠️  YOUTUBE_COOKIES_B64 no definida — yt-dlp puede ser bloqueado por YouTube');
         return;
     }
     try {
-        fs.writeFileSync(COOKIES_PATH, cookieData, 'utf8');
+        const decoded = Buffer.from(cookieData, 'base64').toString('utf8');
+        fs.writeFileSync(COOKIES_PATH, decoded, 'utf8');
         console.log('🍪 Cookies de YouTube cargadas correctamente');
     } catch (err) {
         console.error('❌ Error guardando cookies:', err.message);
