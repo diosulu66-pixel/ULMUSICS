@@ -345,22 +345,44 @@ function checkEmptyChannel() {
 //  yt-dlp helpers
 // ─────────────────────────────────────────────
 
-// Devuelve un Readable stream de audio usando yt-dlp
+// Devuelve un Readable stream PCM S16LE 48kHz stereo listo para Discord
+// Pipeline: yt-dlp (descarga) → ffmpeg (convierte a PCM)
 function ytdlpStream(url) {
-    const args = [
+    // Paso 1: yt-dlp descarga el mejor audio y lo envía a stdout
+    const ytdlp = spawn('yt-dlp', [
         '--no-warnings',
-        '-f', 'bestaudio[ext=webm]/bestaudio/best',
         '--no-playlist',
-        '-o', '-',   // stdout
+        '-f', 'bestaudio/best',
+        '-o', '-',
         url
-    ];
-    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    proc.stderr.on('data', d => {
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    ytdlp.stderr.on('data', d => {
         const msg = d.toString().trim();
-        if (msg) console.error('yt-dlp stderr:', msg);
+        if (msg) console.error('yt-dlp:', msg);
     });
-    proc.on('error', err => console.error('❌ yt-dlp spawn error:', err.message));
-    return proc.stdout;
+    ytdlp.on('error', err => console.error('❌ yt-dlp error:', err.message));
+
+    // Paso 2: ffmpeg convierte cualquier formato a PCM S16LE 48kHz 2ch
+    const ff = spawn(ffmpegPath, [
+        '-i', 'pipe:0',
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        '-loglevel', 'error',
+        'pipe:1'
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    ff.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (msg) console.error('ffmpeg:', msg);
+    });
+    ff.on('error', err => console.error('❌ ffmpeg error:', err.message));
+
+    // Conectar yt-dlp → ffmpeg
+    ytdlp.stdout.pipe(ff.stdin);
+
+    return ff.stdout;
 }
 
 // ─────────────────────────────────────────────
@@ -439,7 +461,7 @@ async function playMusic(channel) {
         console.log(`▶️ ${song.title}`);
 
         const audioStream = ytdlpStream(song.url);
-        const resource    = createAudioResource(audioStream, { inputType: StreamType.Arbitrary });
+        const resource    = createAudioResource(audioStream, { inputType: StreamType.Raw });
 
         // Detectar si yt-dlp falló (stream se cierra sin datos)
         let gotData = false;
