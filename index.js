@@ -320,8 +320,17 @@ async function connectToChannel(voiceChannel) {
             selfDeaf:       false
         });
 
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-        startRecording(connection, voiceChannel.guild.id);
+        // Reconexion automatica si se cae brevemente
+        connection.on(VoiceConnectionStatus.Disconnected, async () => {
+            try {
+                await Promise.race([
+                    entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                    entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+                ]);
+            } catch {
+                try { connection.destroy(); } catch {}
+            }
+        });
 
         connection.on(VoiceConnectionStatus.Destroyed, () => {
             connection = null;
@@ -329,10 +338,33 @@ async function connectToChannel(voiceChannel) {
             stopAllRecordings();
         });
 
-        console.log(`✅ Conectado a: ${voiceChannel.name}`);
+        // Reintentar hasta 3 veces con 20s cada uno
+        let ready = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+                ready = true;
+                break;
+            } catch {
+                console.log(`Intento ${attempt}/3 fallido, reintentando...`);
+                await new Promise(r => setTimeout(r, 2_000));
+            }
+        }
+
+        if (!ready) {
+            console.error('No se pudo conectar despues de 3 intentos');
+            try { connection.destroy(); } catch {}
+            connection = null;
+            return false;
+        }
+
+        startRecording(connection, voiceChannel.guild.id);
+        // Suscribir player al connection siempre al conectar
+        connection.subscribe(player);
+        console.log(`Conectado a: ${voiceChannel.name}`);
         return true;
     } catch (err) {
-        console.error('❌ Error conectando:', err.message);
+        console.error('Error conectando:', err.message);
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         return false;
     }
@@ -650,7 +682,7 @@ client.on('interactionCreate', async (i) => {
     if (i.customId === 'pause')  player.pause();
     if (i.customId === 'resume') player.unpause();
     if (i.customId === 'skip')   player.stop();
-    await i.reply({ content: '✅', ephemeral: true });
+    await i.reply({ content: '✅', flags: 64 }); // 64 = MessageFlags.Ephemeral
 });
 
 // ─────────────────────────────────────────────
