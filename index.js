@@ -3,9 +3,8 @@ process.env.OPUS_SCRIPT = "1";
 require('dotenv').config();
 const fs      = require('fs');
 const path    = require('path');
+const { spawn, execSync } = require('child_process');
 const prism   = require('prism-media');
-// ✅ FIX 1: Reemplazado @distube/ytdl-core por play-dl (sin bloqueo de YouTube)
-const playdl  = require('play-dl');
 const yts     = require('yt-search');
 
 const {
@@ -343,21 +342,51 @@ function checkEmptyChannel() {
 }
 
 // ─────────────────────────────────────────────
-//  Buscar en YouTube (con play-dl)
+//  yt-dlp helpers
 // ─────────────────────────────────────────────
 
+// Devuelve un Readable stream de audio usando yt-dlp
+function ytdlpStream(url) {
+    const args = [
+        '--no-warnings',
+        '-f', 'bestaudio[ext=webm]/bestaudio/best',
+        '--no-playlist',
+        '-o', '-',   // stdout
+        url
+    ];
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    proc.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (msg) console.error('yt-dlp stderr:', msg);
+    });
+    proc.on('error', err => console.error('❌ yt-dlp spawn error:', err.message));
+    return proc.stdout;
+}
+
+// ─────────────────────────────────────────────
+//  Buscar en YouTube
+// ─────────────────────────────────────────────
+
+const YT_URL_RE = /^(https?:\/\/)?(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/)[\w-]+/;
+
 async function searchYoutube(query) {
-    // ✅ FIX 1: Usar play-dl para buscar y validar URLs
-    if (playdl.yt_validate(query) === 'video') {
-        const info = await playdl.video_info(query);
-        const det  = info.video_details;
-        return {
-            title:     det.title,
-            url:       det.url,
-            duration:  formatTime(det.durationInSec),
-            thumbnail: det.thumbnails?.slice(-1)[0]?.url || null
-        };
+    if (YT_URL_RE.test(query)) {
+        // Es una URL directa — obtener metadatos con yt-dlp
+        try {
+            const raw  = execSync(`yt-dlp --no-warnings --dump-json --no-playlist "${query}"`, { timeout: 15000 }).toString();
+            const info = JSON.parse(raw);
+            return {
+                title:     info.title,
+                url:       `https://www.youtube.com/watch?v=${info.id}`,
+                duration:  formatTime(info.duration),
+                thumbnail: info.thumbnail || null
+            };
+        } catch (err) {
+            console.error('❌ yt-dlp info error:', err.message);
+            return null;
+        }
     }
+    // Búsqueda por texto — yt-search es suficiente para obtener la URL
     const result = await yts(query);
     const video  = result.videos[0];
     if (!video) return null;
@@ -396,11 +425,10 @@ function buildButtons() {
 }
 
 // ─────────────────────────────────────────────
-//  Reproducción con play-dl
+//  Reproducción con yt-dlp
 // ─────────────────────────────────────────────
 
 async function playMusic(channel) {
-    // ✅ FIX 2: Guard contra ejecuciones simultáneas
     if (isPlaying) return;
     if (!queue.length || !connection) return;
 
@@ -408,11 +436,24 @@ async function playMusic(channel) {
     const song = queue[0];
 
     try {
-        // ✅ FIX 1: play-dl en lugar de ytdl-core
-        const stream = await playdl.stream(song.url, { quality: 2 });
+        console.log(`▶️ ${song.title}`);
 
-        const resource = createAudioResource(stream.stream, {
-            inputType: stream.type
+        const audioStream = ytdlpStream(song.url);
+        const resource    = createAudioResource(audioStream, { inputType: StreamType.Arbitrary });
+
+        // Detectar si yt-dlp falló (stream se cierra sin datos)
+        let gotData = false;
+        audioStream.once('data', () => { gotData = true; });
+        audioStream.once('close', () => {
+            if (!gotData) {
+                console.error('❌ yt-dlp: stream vacío para', song.url);
+                if (isPlaying) {
+                    isPlaying = false;
+                    queue.shift();
+                    if (queue.length && currentChannel) setTimeout(() => playMusic(currentChannel), 1000);
+                    else nowPlayingMsg = null;
+                }
+            }
         });
 
         player.play(resource);
@@ -429,13 +470,10 @@ async function playMusic(channel) {
             nowPlayingMsg = await channel.send({ embeds: [embed], components: [row] });
         }
 
-        console.log(`▶️ ${song.title}`);
-
     } catch (err) {
         console.error('❌ Error reproduciendo:', err.message);
         isPlaying = false;
         queue.shift();
-        // ✅ FIX 3: Pequeña pausa antes de intentar la siguiente canción
         if (queue.length && currentChannel) {
             setTimeout(() => playMusic(currentChannel), 1000);
         } else {
