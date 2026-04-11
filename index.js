@@ -229,93 +229,124 @@ function convertAndUpload(pcmPath, remoteName) {
 //  FIX #2: lógica de chunks corregida
 // ─────────────────────────────────────────────
 
-const activeRecordings = new Map();
+// ─────────────────────────────────────────────
+//  Grabación continua del canal
+//  - Una sola sesión de grabación por guild
+//  - Graba a todos los usuarios que hablan mezclados en un PCM
+//  - Espera 6s de silencio total en el canal antes de cerrar y subir
+//  - Si la sesión supera 20min, la corta y sube y abre una nueva
+// ─────────────────────────────────────────────
 
-function startUserRecording(receiver, userId, guildId) {
-    if (activeRecordings.has(userId)) return;
+const SILENCE_TIMEOUT_MS = 6_000;   // 6s sin que nadie hable → cortar y subir
+const MAX_SESSION_MS     = 20 * 60 * 1000; // 20 min máximo por sesión
 
-    // Marcamos que está activo ANTES de arrancar el chunk
-    activeRecordings.set(userId, true);
+// Estado de la sesión de grabación actual (una por guild)
+let recSession = null;
+// { guildId, pcmPath, remoteName, writeStream, userStreams: Map<userId, {opus,decoder}>,
+//   silenceTimer, maxTimer, startedAt }
 
-    const startChunk = (chunkIndex) => {
-        // Si ya no está activo (fue detenido), salir
-        if (!activeRecordings.has(userId)) return;
+function _flushSession() {
+    if (!recSession) return;
+    const { silenceTimer, maxTimer, writeStream, pcmPath, remoteName, userStreams } = recSession;
 
-        const ts          = Date.now();
-        const pcmPath     = tmpPath(`${guildId}_${userId}_${ts}_${chunkIndex}.pcm`);
-        const remoteName  = `${guildId}/${userId}_${ts}_${chunkIndex}.mp3`;
-        const writeStream = fs.createWriteStream(pcmPath);
+    clearTimeout(silenceTimer);
+    clearTimeout(maxTimer);
 
-        const opusStream = receiver.subscribe(userId, {
-            end: { behavior: EndBehaviorType.AfterSilence, duration: 100 }  // FIX #2: AfterSilence detecta cuando el user para
-        });
+    // Cerrar todos los streams de usuarios activos
+    for (const [, s] of userStreams) {
+        try { s.opus.destroy(); } catch {}
+    }
+    userStreams.clear();
 
-        const decoder = new prism.opus.Decoder({
-            rate: 48000, channels: 2, frameSize: 960
-        });
+    recSession = null;
 
-        opusStream.pipe(decoder).pipe(writeStream);
-
-        // Guardar la referencia del chunk actual
-        activeRecordings.set(userId, { writeStream, pcmPath, opusStream, chunkIndex });
-
-        // Cortar chunk cada 20s
-        const timer = setTimeout(() => {
-            if (!activeRecordings.has(userId)) return;
-            opusStream.destroy();
-            writeStream.end();
-            writeStream.once('finish', () => {
-                convertAndUpload(pcmPath, remoteName);
-                // Iniciar siguiente chunk si sigue activo
-                if (activeRecordings.has(userId)) {
-                    activeRecordings.set(userId, true); // reset para permitir re-suscripción
-                    startChunk(chunkIndex + 1);
-                }
-            });
-        }, 20_000);
-
-        // Usuario dejó de hablar / stream terminó antes de los 20s
-        opusStream.on('end', () => {
-            clearTimeout(timer);
-            writeStream.end();
-            writeStream.once('finish', () => {
-                convertAndUpload(pcmPath, remoteName);
-                // FIX #2: borrar DESPUÉS de convertir, no antes — y solo si no fue reemplazado
-                activeRecordings.delete(userId);
-            });
-        });
-
-        opusStream.on('error', () => {
-            clearTimeout(timer);
-            writeStream.end();
-            activeRecordings.delete(userId);
-        });
-
-        console.log(`🎙️ Grabando: ${userId} chunk ${chunkIndex}`);
-    };
-
-    startChunk(0);
+    writeStream.end();
+    writeStream.once('finish', () => {
+        console.log(`🎙️ Sesión terminada → convirtiendo ${pcmPath}`);
+        convertAndUpload(pcmPath, remoteName);
+    });
 }
 
-function stopUserRecording(userId) {
-    const rec = activeRecordings.get(userId);
-    if (!rec) return;
-    if (typeof rec === 'object') {
-        try { rec.opusStream?.destroy(); } catch {}
-        rec.writeStream?.end();
-    }
-    activeRecordings.delete(userId);
+function _resetSilenceTimer() {
+    if (!recSession) return;
+    clearTimeout(recSession.silenceTimer);
+    recSession.silenceTimer = setTimeout(() => {
+        console.log(`⏱️ ${SILENCE_TIMEOUT_MS / 1000}s de silencio — cerrando sesión`);
+        _flushSession();
+    }, SILENCE_TIMEOUT_MS);
+}
+
+function _subscribeUser(receiver, userId) {
+    if (!recSession) return;
+    if (recSession.userStreams.has(userId)) return; // ya suscrito
+
+    const opus = receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
+    });
+    const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+
+    opus.pipe(decoder);
+    decoder.on('data', (chunk) => {
+        if (recSession) recSession.writeStream.write(chunk);
+    });
+
+    opus.on('end', () => {
+        if (!recSession) return;
+        recSession.userStreams.delete(userId);
+        console.log(`🔇 ${userId} dejó de hablar`);
+        // Reiniciar el timer de silencio cuando alguien para
+        _resetSilenceTimer();
+    });
+
+    opus.on('error', () => {
+        if (recSession) recSession.userStreams.delete(userId);
+    });
+
+    recSession.userStreams.set(userId, { opus, decoder });
+    console.log(`🎙️ Suscrito a: ${userId}`);
 }
 
 function startRecording(conn, guildId) {
     conn.receiver.speaking.on('start', (userId) => {
-        startUserRecording(conn.receiver, userId, guildId);
+        if (!recSession) {
+            // Iniciar nueva sesión
+            const ts         = Date.now();
+            const pcmPath    = tmpPath(`${guildId}_session_${ts}.pcm`);
+            const remoteName = `${guildId}/session_${ts}.mp3`;
+            const writeStream = fs.createWriteStream(pcmPath);
+
+            recSession = {
+                guildId,
+                pcmPath,
+                remoteName,
+                writeStream,
+                userStreams: new Map(),
+                silenceTimer: null,
+                maxTimer: null,
+                startedAt: ts
+            };
+
+            // Timer máximo de seguridad (20 min)
+            recSession.maxTimer = setTimeout(() => {
+                console.log('⏱️ Sesión de 20min alcanzada — rotando');
+                _flushSession();
+            }, MAX_SESSION_MS);
+
+            console.log(`🎤 Nueva sesión de grabación: ${pcmPath}`);
+        }
+
+        // Cancelar el timer de silencio porque alguien habló
+        clearTimeout(recSession.silenceTimer);
+        recSession.silenceTimer = null;
+
+        _subscribeUser(conn.receiver, userId);
     });
+
     console.log('🎤 Grabación activa');
 }
 
 function stopAllRecordings() {
-    for (const userId of activeRecordings.keys()) stopUserRecording(userId);
+    _flushSession();
 }
 
 // ─────────────────────────────────────────────
@@ -458,19 +489,21 @@ async function playMusic(channel) {
         const cid = await play.getFreeClientID();
         await play.setToken({ soundcloud: { client_id: cid } });
 
-        const stream = await play.stream(song.url, {
-            discordPlayerCompatibility: true
-        });
+        // SoundCloud requiere obtener la URL directa del stream HLS/HTTP
+        // play.stream() con discordPlayerCompatibility devuelve Opus encapsulado
+        // que en Railway no funciona. Usamos la URL directa con ffmpeg como fuente.
+        const scStream = await play.stream(song.url);
+        console.log(`🎵 Stream type: ${scStream.type}`);
 
-        // En Railway el stream Opus de play-dl no llega bien al pipeline de voz.
-        // Lo transcodificamos a PCM raw con ffmpeg y lo pasamos como StreamType.Raw
-        // para que @discordjs/voice lo re-encodee con opusscript correctamente.
-        const transcoded = ffmpeg(stream.stream)
-            .inputFormat(stream.type === 'opus' ? 'opus' : 'webm')
+        // Pasar el stream directamente a ffmpeg como input (pipe)
+        // ffmpeg detecta el formato automáticamente (no forzar inputFormat)
+        const transcoded = ffmpeg()
+            .input(scStream.stream)
             .audioFrequency(48000)
             .audioChannels(2)
             .audioCodec('pcm_s16le')
             .format('s16le')
+            .on('start', (cmd) => console.log('🎬 ffmpeg iniciado'))
             .on('error', (err) => console.error('❌ ffmpeg transcode error:', err.message))
             .pipe();
 
