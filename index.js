@@ -45,6 +45,27 @@ const supabase = createClient(
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'recordings';
 
 // ─────────────────────────────────────────────
+//  Cookies de YouTube (para evitar bloqueo en VPS)
+// ─────────────────────────────────────────────
+
+const COOKIES_PATH = '/tmp/yt_cookies.txt';
+
+function setupCookies() {
+    const cookieData = process.env.YOUTUBE_COOKIES;
+    if (!cookieData) {
+        console.warn('⚠️  YOUTUBE_COOKIES no definida — yt-dlp puede ser bloqueado por YouTube');
+        return;
+    }
+    try {
+        fs.writeFileSync(COOKIES_PATH, cookieData, 'utf8');
+        console.log('🍪 Cookies de YouTube cargadas correctamente');
+    } catch (err) {
+        console.error('❌ Error guardando cookies:', err.message);
+    }
+}
+setupCookies();
+
+// ─────────────────────────────────────────────
 //  Discord client
 // ─────────────────────────────────────────────
 
@@ -348,12 +369,15 @@ function checkEmptyChannel() {
 // Devuelve un Readable stream PCM S16LE 48kHz stereo listo para Discord
 // Pipeline: yt-dlp (descarga) → ffmpeg (convierte a PCM)
 function ytdlpStream(url) {
+    const cookiesArgs = fs.existsSync(COOKIES_PATH) ? ['--cookies', COOKIES_PATH] : [];
+
     // Paso 1: yt-dlp descarga el mejor audio y lo envía a stdout
     const ytdlp = spawn('yt-dlp', [
         '--no-warnings',
         '--no-playlist',
         '-f', 'bestaudio/best',
         '-o', '-',
+        ...cookiesArgs,
         url
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -395,7 +419,8 @@ async function searchYoutube(query) {
     if (YT_URL_RE.test(query)) {
         // Es una URL directa — obtener metadatos con yt-dlp
         try {
-            const raw  = execSync(`yt-dlp --no-warnings --dump-json --no-playlist "${query}"`, { timeout: 15000 }).toString();
+            const cookiesFlag = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
+            const raw  = execSync(`yt-dlp --no-warnings --dump-json --no-playlist ${cookiesFlag} "${query}"`, { timeout: 15000 }).toString();
             const info = JSON.parse(raw);
             return {
                 title:     info.title,
