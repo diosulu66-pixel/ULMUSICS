@@ -312,50 +312,27 @@ async function connectToChannel(voiceChannel) {
         connection = null;
     }
 
-    try {
-        connection = joinVoiceChannel({
-            channelId:      voiceChannel.id,
-            guildId:        voiceChannel.guild.id,
-            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-            selfDeaf:       false
-        });
+    connection = joinVoiceChannel({
+        channelId:      voiceChannel.id,
+        guildId:        voiceChannel.guild.id,
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf:       false
+    });
 
-        connection.on(VoiceConnectionStatus.Destroyed, () => {
-            connection = null;
-            queue = [];
-            stopAllRecordings();
-        });
+    connection.on(VoiceConnectionStatus.Destroyed, () => {
+        connection = null;
+        queue = [];
+        stopAllRecordings();
+    });
 
-        // Esperar Ready via evento, sin entersState que falla en Railway
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('timeout')), 30_000);
+    // No esperamos Ready — Railway lo conecta pero el evento llega tarde
+    // Pequeña pausa para que el handshake de voz complete
+    await new Promise(r => setTimeout(r, 2_000));
 
-            // Si ya está Ready (conexión instantánea)
-            if (connection.state.status === VoiceConnectionStatus.Ready) {
-                clearTimeout(timeout);
-                return resolve();
-            }
-
-            connection.once(VoiceConnectionStatus.Ready, () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-
-            connection.once(VoiceConnectionStatus.Destroyed, () => {
-                clearTimeout(timeout);
-                reject(new Error('destroyed'));
-            });
-        });
-
-        startRecording(connection, voiceChannel.guild.id);
-        connection.subscribe(player);
-        console.log(`✅ Conectado a: ${voiceChannel.name}`);
-        return true;
-    } catch (err) {
-        console.error('❌ Error conectando:', err.message);
-        if (connection) { try { connection.destroy(); } catch {} connection = null; }
-        return false;
-    }
+    startRecording(connection, voiceChannel.guild.id);
+    connection.subscribe(player);
+    console.log(`✅ Conectado a: ${voiceChannel.name} (estado: ${connection.state.status})`);
+    return true;
 }
 
 // ─────────────────────────────────────────────
