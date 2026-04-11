@@ -31,6 +31,7 @@ const play       = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
 const ffmpeg     = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
+const { spawn }  = require('child_process');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ─────────────────────────────────────────────
@@ -489,25 +490,35 @@ async function playMusic(channel) {
         const cid = await play.getFreeClientID();
         await play.setToken({ soundcloud: { client_id: cid } });
 
-        // SoundCloud requiere obtener la URL directa del stream HLS/HTTP
-        // play.stream() con discordPlayerCompatibility devuelve Opus encapsulado
-        // que en Railway no funciona. Usamos la URL directa con ffmpeg como fuente.
         const scStream = await play.stream(song.url);
         console.log(`🎵 Stream type: ${scStream.type}`);
 
-        // Pasar el stream directamente a ffmpeg como input (pipe)
-        // ffmpeg detecta el formato automáticamente (no forzar inputFormat)
-        const transcoded = ffmpeg()
-            .input(scStream.stream)
-            .audioFrequency(48000)
-            .audioChannels(2)
-            .audioCodec('pcm_s16le')
-            .format('s16le')
-            .on('start', (cmd) => console.log('🎬 ffmpeg iniciado'))
-            .on('error', (err) => console.error('❌ ffmpeg transcode error:', err.message))
-            .pipe();
+        // Usamos spawn directo de ffmpeg con stdin/stdout para máxima compatibilidad
+        // fluent-ffmpeg().pipe() no emite datos correctamente en Railway
+        const ffmpegProc = spawn(ffmpegPath, [
+            '-i', 'pipe:0',          // leer desde stdin
+            '-f', 's16le',           // formato PCM raw
+            '-ar', '48000',          // sample rate 48kHz
+            '-ac', '2',              // stereo
+            '-acodec', 'pcm_s16le',
+            'pipe:1'                 // escribir a stdout
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
-        const resource = createAudioResource(transcoded, {
+        // Conectar el stream de SoundCloud al stdin de ffmpeg
+        scStream.stream.pipe(ffmpegProc.stdin);
+
+        ffmpegProc.stderr.on('data', (d) => {
+            const msg = d.toString();
+            if (msg.includes('Error') || msg.includes('Invalid')) {
+                console.error('❌ ffmpeg stderr:', msg.trim());
+            }
+        });
+
+        ffmpegProc.on('spawn',  ()    => console.log('🎬 ffmpeg spawned'));
+        ffmpegProc.on('error',  (err) => console.error('❌ ffmpeg spawn error:', err.message));
+        ffmpegProc.on('close',  (code)=> console.log(`🎬 ffmpeg cerrado con código ${code}`));
+
+        const resource = createAudioResource(ffmpegProc.stdout, {
             inputType: StreamType.Raw,
             inlineVolume: false
         });
