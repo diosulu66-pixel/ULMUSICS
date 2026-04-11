@@ -4,7 +4,8 @@ require('dotenv').config();
 const fs      = require('fs');
 const path    = require('path');
 const prism   = require('prism-media');
-const ytdl    = require('@distube/ytdl-core');
+// ✅ FIX 1: Reemplazado @distube/ytdl-core por play-dl (sin bloqueo de YouTube)
+const playdl  = require('play-dl');
 const yts     = require('yt-search');
 
 const {
@@ -72,6 +73,8 @@ let autoplay        = true;
 let disconnectTimer = null;
 let isConnecting    = false;
 let nowPlayingMsg   = null;
+// ✅ FIX 2: Flag para evitar que Idle y error disparen playMusic al mismo tiempo
+let isPlaying       = false;
 
 // ─────────────────────────────────────────────
 //  Blacklist
@@ -255,7 +258,7 @@ async function connectToChannel(voiceChannel) {
     });
 
     connection.on(VoiceConnectionStatus.Destroyed, () => {
-        connection = null; queue = []; stopAllRecordings();
+        connection = null; queue = []; isPlaying = false; stopAllRecordings();
     });
 
     try {
@@ -287,7 +290,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     // Bot desconectado manualmente → resetear estado
     if (oldState.member?.user?.id === client.user?.id) {
         if (oldState.channelId && !newState.channelId) {
-            connection = null; queue = []; nowPlayingMsg = null;
+            connection = null; queue = []; nowPlayingMsg = null; isPlaying = false;
             stopAllRecordings();
             console.log('🔌 Bot desconectado manualmente');
         }
@@ -326,7 +329,7 @@ function checkEmptyChannel() {
                 const ch = client.channels.cache.get(channelId);
                 const empty = !ch || ch.members.filter(m => !m.user.bot).size === 0;
                 if (empty && connection) {
-                    queue = []; nowPlayingMsg = null;
+                    queue = []; nowPlayingMsg = null; isPlaying = false;
                     player.stop(); stopAllRecordings();
                     try { connection.destroy(); } catch {}
                     connection = null;
@@ -340,17 +343,18 @@ function checkEmptyChannel() {
 }
 
 // ─────────────────────────────────────────────
-//  Buscar en YouTube
+//  Buscar en YouTube (con play-dl)
 // ─────────────────────────────────────────────
 
 async function searchYoutube(query) {
-    if (ytdl.validateURL(query)) {
-        const info = await ytdl.getBasicInfo(query);
-        const det  = info.videoDetails;
+    // ✅ FIX 1: Usar play-dl para buscar y validar URLs
+    if (playdl.yt_validate(query) === 'video') {
+        const info = await playdl.video_info(query);
+        const det  = info.video_details;
         return {
             title:     det.title,
-            url:       det.video_url,
-            duration:  formatTime(parseInt(det.lengthSeconds)),
+            url:       det.url,
+            duration:  formatTime(det.durationInSec),
             thumbnail: det.thumbnails?.slice(-1)[0]?.url || null
         };
     }
@@ -392,26 +396,25 @@ function buildButtons() {
 }
 
 // ─────────────────────────────────────────────
-//  Reproducción con ytdl-core
+//  Reproducción con play-dl
 // ─────────────────────────────────────────────
 
 async function playMusic(channel) {
+    // ✅ FIX 2: Guard contra ejecuciones simultáneas
+    if (isPlaying) return;
     if (!queue.length || !connection) return;
+
+    isPlaying = true;
     const song = queue[0];
 
     try {
-        const ytStream = ytdl(song.url, {
-            filter:        'audioonly',
-            quality:       'highestaudio',
-            highWaterMark: 1 << 25
+        // ✅ FIX 1: play-dl en lugar de ytdl-core
+        const stream = await playdl.stream(song.url, { quality: 2 });
+
+        const resource = createAudioResource(stream.stream, {
+            inputType: stream.type
         });
 
-        ytStream.on('error', (err) => {
-            console.error('❌ ytdl error:', err.message);
-            player.stop();
-        });
-
-        const resource = createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
         player.play(resource);
         connection.subscribe(player);
 
@@ -430,18 +433,27 @@ async function playMusic(channel) {
 
     } catch (err) {
         console.error('❌ Error reproduciendo:', err.message);
+        isPlaying = false;
         queue.shift();
-        if (queue.length) playMusic(channel);
+        // ✅ FIX 3: Pequeña pausa antes de intentar la siguiente canción
+        if (queue.length && currentChannel) {
+            setTimeout(() => playMusic(currentChannel), 1000);
+        } else {
+            nowPlayingMsg = null;
+        }
     }
 }
 
+// ✅ FIX 2: Evento Idle — el único punto que avanza la cola en condiciones normales
 player.on(AudioPlayerStatus.Idle, async () => {
+    isPlaying = false;
     queue.shift();
 
     if (!queue.length && autoplay) {
         try {
             const terms  = ['lofi hip hop', 'chill beats', 'aesthetic music', 'sad lofi'];
-            const result = await yts(terms[Math.floor(Math.random() * terms.length)]);
+            const term   = terms[Math.floor(Math.random() * terms.length)];
+            const result = await yts(term);
             const videos = result.videos.slice(0, 5);
             if (videos.length) {
                 const v = videos[Math.floor(Math.random() * videos.length)];
@@ -450,15 +462,20 @@ player.on(AudioPlayerStatus.Idle, async () => {
         } catch (err) { console.error('❌ Autoplay error:', err.message); }
     }
 
-    if (currentChannel && queue.length) playMusic(currentChannel);
-    else nowPlayingMsg = null;
+    if (currentChannel && queue.length) {
+        // ✅ FIX 3: Pequeña pausa entre canciones para evitar rate-limits
+        setTimeout(() => playMusic(currentChannel), 500);
+    } else {
+        nowPlayingMsg = null;
+    }
 });
 
+// ✅ FIX 2: Evento error — NO avanza la cola, solo libera el flag; Idle lo manejará
 player.on('error', (err) => {
     console.error('❌ Player error:', err.message);
-    queue.shift();
-    if (currentChannel && queue.length) playMusic(currentChannel);
-    else nowPlayingMsg = null;
+    // No hacer queue.shift() aquí — Idle se dispara justo después
+    // Solo liberar el flag para que Idle pueda continuar
+    isPlaying = false;
 });
 
 // ─────────────────────────────────────────────
@@ -499,8 +516,12 @@ client.on('messageCreate', async (msg) => {
             if (!song) return loadMsg.edit('❌ No encontré resultados.');
             song.user = msg.author.username;
             queue.push(song);
-            if (queue.length === 1) { await loadMsg.delete().catch(() => {}); playMusic(msg.channel); }
-            else await loadMsg.edit(`✅ **${song.title}** en cola (#${queue.length}).`);
+            if (queue.length === 1 && !isPlaying) {
+                await loadMsg.delete().catch(() => {});
+                playMusic(msg.channel);
+            } else {
+                await loadMsg.edit(`✅ **${song.title}** en cola (#${queue.length}).`);
+            }
         } catch (err) {
             console.error('❌ -play error:', err.message);
             await loadMsg.edit(`❌ ${err.message}`);
@@ -518,7 +539,7 @@ client.on('messageCreate', async (msg) => {
     if (cmd === 'skip')     { player.stop();    return msg.react('⏭️'); }
 
     if (cmd === 'stop') {
-        queue = []; nowPlayingMsg = null; player.stop(); stopAllRecordings();
+        queue = []; nowPlayingMsg = null; isPlaying = false; player.stop(); stopAllRecordings();
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         return msg.react('⏹️');
     }
@@ -553,7 +574,7 @@ client.on('messageCreate', async (msg) => {
         } else {
             blacklistedChannels.add(channelId); saveBlacklist(blacklistedChannels);
             if (connection?.joinConfig?.channelId === channelId) {
-                queue = []; player.stop(); stopAllRecordings();
+                queue = []; player.stop(); stopAllRecordings(); isPlaying = false;
                 try { connection.destroy(); } catch {}
                 connection = null;
             }
@@ -577,7 +598,7 @@ client.on('interactionCreate', async (i) => {
         player.stop();
 
     } else if (i.customId === 'btn_stop') {
-        queue = []; nowPlayingMsg = null; player.stop(); stopAllRecordings();
+        queue = []; nowPlayingMsg = null; isPlaying = false; player.stop(); stopAllRecordings();
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
         try { await i.message.delete(); } catch {}
 
