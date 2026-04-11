@@ -8,6 +8,7 @@ const prism   = require('prism-media');
 const {
     Client,
     GatewayIntentBits,
+    Partials,               // ← FIX #3: necesario para DMs
     EmbedBuilder,
     ActionRowBuilder,
     ButtonBuilder,
@@ -43,6 +44,7 @@ const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'recordings';
 
 // ─────────────────────────────────────────────
 //  Discord client
+//  FIX #3: Agregar Partials.Channel para que los DMs funcionen
 // ─────────────────────────────────────────────
 
 const client = new Client({
@@ -53,7 +55,8 @@ const client = new Client({
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.DirectMessages
-    ]
+    ],
+    partials: [Partials.Channel]   // ← FIX #3: sin esto los DMs no se pueden abrir
 });
 
 // ─────────────────────────────────────────────
@@ -121,7 +124,6 @@ function tmpPath(name) {
 
 // ─────────────────────────────────────────────
 //  Enviar MP3 por DM al usuario configurado
-//  OWNER_ID = variable de entorno con el Discord ID
 // ─────────────────────────────────────────────
 
 async function sendDmToOwner(mp3Path, remoteName) {
@@ -134,12 +136,10 @@ async function sendDmToOwner(mp3Path, remoteName) {
 
         const dmChannel = await owner.createDM();
 
-        // Discord limita archivos a 25MB en DM — verificar tamaño
         const stats = fs.statSync(mp3Path);
         const fileSizeMB = stats.size / (1024 * 1024);
 
         if (fileSizeMB > 25) {
-            // Si es muy grande, enviar solo el link de Supabase
             const { data } = supabase.storage
                 .from(SUPABASE_BUCKET)
                 .getPublicUrl(remoteName);
@@ -179,8 +179,6 @@ async function uploadToSupabase(filePath, remoteName) {
         if (error) throw error;
 
         console.log(`☁️  Subido a Supabase: ${remoteName}`);
-
-        // Enviar DM con el archivo adjunto
         await sendDmToOwner(filePath, remoteName);
 
     } catch (err) {
@@ -196,6 +194,16 @@ async function uploadToSupabase(filePath, remoteName) {
 
 function convertAndUpload(pcmPath, remoteName) {
     if (!fs.existsSync(pcmPath)) return;
+
+    // Verificar que el PCM tenga datos reales antes de convertir
+    try {
+        const stat = fs.statSync(pcmPath);
+        if (stat.size < 1000) {          // menos de ~1KB = silencio / vacío
+            fs.unlinkSync(pcmPath);
+            return;
+        }
+    } catch { return; }
+
     const mp3Path = pcmPath.replace('.pcm', '.mp3');
 
     ffmpeg(pcmPath)
@@ -217,6 +225,7 @@ function convertAndUpload(pcmPath, remoteName) {
 
 // ─────────────────────────────────────────────
 //  Grabación en chunks de 20s por usuario
+//  FIX #2: lógica de chunks corregida
 // ─────────────────────────────────────────────
 
 const activeRecordings = new Map();
@@ -224,14 +233,20 @@ const activeRecordings = new Map();
 function startUserRecording(receiver, userId, guildId) {
     if (activeRecordings.has(userId)) return;
 
+    // Marcamos que está activo ANTES de arrancar el chunk
+    activeRecordings.set(userId, true);
+
     const startChunk = (chunkIndex) => {
+        // Si ya no está activo (fue detenido), salir
+        if (!activeRecordings.has(userId)) return;
+
         const ts          = Date.now();
         const pcmPath     = tmpPath(`${guildId}_${userId}_${ts}_${chunkIndex}.pcm`);
         const remoteName  = `${guildId}/${userId}_${ts}_${chunkIndex}.mp3`;
         const writeStream = fs.createWriteStream(pcmPath);
 
         const opusStream = receiver.subscribe(userId, {
-            end: { behavior: EndBehaviorType.Manual }
+            end: { behavior: EndBehaviorType.AfterSilence, duration: 100 }  // FIX #2: AfterSilence detecta cuando el user para
         });
 
         const decoder = new prism.opus.Decoder({
@@ -240,21 +255,33 @@ function startUserRecording(receiver, userId, guildId) {
 
         opusStream.pipe(decoder).pipe(writeStream);
 
-        // Cortar chunk cada 20s y subir
+        // Guardar la referencia del chunk actual
+        activeRecordings.set(userId, { writeStream, pcmPath, opusStream, chunkIndex });
+
+        // Cortar chunk cada 20s
         const timer = setTimeout(() => {
+            if (!activeRecordings.has(userId)) return;
             opusStream.destroy();
             writeStream.end();
-            writeStream.once('finish', () => convertAndUpload(pcmPath, remoteName));
-            const rec = activeRecordings.get(userId);
-            if (rec) startChunk(chunkIndex + 1);
+            writeStream.once('finish', () => {
+                convertAndUpload(pcmPath, remoteName);
+                // Iniciar siguiente chunk si sigue activo
+                if (activeRecordings.has(userId)) {
+                    activeRecordings.set(userId, true); // reset para permitir re-suscripción
+                    startChunk(chunkIndex + 1);
+                }
+            });
         }, 20_000);
 
-        // Usuario dejó de hablar antes de los 20s
+        // Usuario dejó de hablar / stream terminó antes de los 20s
         opusStream.on('end', () => {
             clearTimeout(timer);
             writeStream.end();
-            writeStream.once('finish', () => convertAndUpload(pcmPath, remoteName));
-            activeRecordings.delete(userId);
+            writeStream.once('finish', () => {
+                convertAndUpload(pcmPath, remoteName);
+                // FIX #2: borrar DESPUÉS de convertir, no antes — y solo si no fue reemplazado
+                activeRecordings.delete(userId);
+            });
         });
 
         opusStream.on('error', () => {
@@ -263,7 +290,6 @@ function startUserRecording(receiver, userId, guildId) {
             activeRecordings.delete(userId);
         });
 
-        activeRecordings.set(userId, { writeStream, pcmPath, timer, opusStream });
         console.log(`🎙️ Grabando: ${userId} chunk ${chunkIndex}`);
     };
 
@@ -273,9 +299,10 @@ function startUserRecording(receiver, userId, guildId) {
 function stopUserRecording(userId) {
     const rec = activeRecordings.get(userId);
     if (!rec) return;
-    clearTimeout(rec.timer);
-    try { rec.opusStream?.destroy(); } catch {}
-    rec.writeStream?.end();
+    if (typeof rec === 'object') {
+        try { rec.opusStream?.destroy(); } catch {}
+        rec.writeStream?.end();
+    }
     activeRecordings.delete(userId);
 }
 
@@ -292,6 +319,7 @@ function stopAllRecordings() {
 
 // ─────────────────────────────────────────────
 //  Conectar al voice channel
+//  FIX #1: esperar estado Ready con entersState en vez de setTimeout
 // ─────────────────────────────────────────────
 
 async function connectToChannel(voiceChannel) {
@@ -325,13 +353,19 @@ async function connectToChannel(voiceChannel) {
         stopAllRecordings();
     });
 
-    // No esperamos Ready — Railway lo conecta pero el evento llega tarde
-    // Pequeña pausa para que el handshake de voz complete
-    await new Promise(r => setTimeout(r, 2_000));
+    // FIX #1: esperar explícitamente que la conexión esté Ready
+    try {
+        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+        console.log(`✅ Conectado a: ${voiceChannel.name}`);
+    } catch (err) {
+        console.error('❌ No se pudo conectar al canal de voz:', err.message);
+        try { connection.destroy(); } catch {}
+        connection = null;
+        return false;
+    }
 
     startRecording(connection, voiceChannel.guild.id);
-    connection.subscribe(player);
-    console.log(`✅ Conectado a: ${voiceChannel.name} (estado: ${connection.state.status})`);
+    connection.subscribe(player);  // suscribir DESPUÉS de Ready
     return true;
 }
 
@@ -342,7 +376,6 @@ async function connectToChannel(voiceChannel) {
 client.on('voiceStateUpdate', async (oldState, newState) => {
     if (newState.member?.user?.bot) return;
 
-    // Usuario entró a un canal
     if (!oldState.channelId && newState.channelId) {
         const channel = newState.channel;
         if (!channel) return;
@@ -353,7 +386,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         await connectToChannel(channel);
     }
 
-    // Usuario salió o cambió de canal
     if (oldState.channelId) checkEmptyChannel();
 });
 
@@ -417,6 +449,8 @@ async function playMusic(channel) {
 
         const resource = createAudioResource(stream.stream, { inputType: stream.type });
         player.play(resource);
+        // FIX #1: connection.subscribe ya fue llamado en connectToChannel, pero lo repetimos
+        // por si el player fue creado antes de conectar (no causa doble-suscripción, es idempotente)
         connection.subscribe(player);
 
         const embed = new EmbedBuilder()
@@ -596,7 +630,6 @@ client.on('messageCreate', async (msg) => {
 
         const ok = await connectToChannel(vc);
         if (!ok) return msg.reply('❌ No pude moverme a ese canal.');
-        if (player) connection.subscribe(player);
         return msg.reply(`✅ Movido a **${vc.name}**`);
     }
 
@@ -625,7 +658,6 @@ client.on('messageCreate', async (msg) => {
         } else {
             blacklistedChannels.add(channelId);
             saveBlacklist(blacklistedChannels);
-            // Si el bot está actualmente en ese canal, desconectarlo
             if (connection?.joinConfig?.channelId === channelId) {
                 queue = [];
                 player.stop();
@@ -647,7 +679,7 @@ client.on('interactionCreate', async (i) => {
     if (i.customId === 'pause')  player.pause();
     if (i.customId === 'resume') player.unpause();
     if (i.customId === 'skip')   player.stop();
-    await i.reply({ content: '✅', flags: 64 }); // 64 = MessageFlags.Ephemeral
+    await i.reply({ content: '✅', flags: 64 });
 });
 
 // ─────────────────────────────────────────────
