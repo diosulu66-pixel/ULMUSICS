@@ -353,19 +353,33 @@ async function connectToChannel(voiceChannel) {
         stopAllRecordings();
     });
 
-    // FIX #1: esperar explícitamente que la conexión esté Ready
+    // En Railway el handshake UDP puede tardar o no llegar a Ready
+    // aunque el bot SÍ está en el canal. Esperamos Ready pero si
+    // timeout, verificamos que al menos esté en Signalling/Connecting
+    // y continuamos igual — Discord reproduce audio en ese estado.
     try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-        console.log(`✅ Conectado a: ${voiceChannel.name}`);
-    } catch (err) {
-        console.error('❌ No se pudo conectar al canal de voz:', err.message);
-        try { connection.destroy(); } catch {}
-        connection = null;
-        return false;
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        console.log(`✅ Conectado (Ready) a: ${voiceChannel.name}`);
+    } catch {
+        const status = connection.state.status;
+        if (
+            status === VoiceConnectionStatus.Ready      ||
+            status === VoiceConnectionStatus.Signalling ||
+            status === VoiceConnectionStatus.Connecting
+        ) {
+            console.warn(`⚠️  Timeout esperando Ready (estado actual: ${status}) — continuando de todas formas`);
+            // Esperar un poco más para el handshake UDP
+            await new Promise(r => setTimeout(r, 3_000));
+        } else {
+            console.error(`❌ Conexión fallida con estado: ${status}`);
+            try { connection.destroy(); } catch {}
+            connection = null;
+            return false;
+        }
     }
 
     startRecording(connection, voiceChannel.guild.id);
-    connection.subscribe(player);  // suscribir DESPUÉS de Ready
+    connection.subscribe(player);
     return true;
 }
 
