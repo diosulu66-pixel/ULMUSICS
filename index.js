@@ -8,7 +8,7 @@ const prism   = require('prism-media');
 const {
     Client,
     GatewayIntentBits,
-    Partials,               // ← FIX #3: necesario para DMs
+    Partials,
     EmbedBuilder,
     ActionRowBuilder,
     ButtonBuilder,
@@ -31,7 +31,6 @@ const play       = require('play-dl');
 const { createClient } = require('@supabase/supabase-js');
 const ffmpeg     = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ─────────────────────────────────────────────
@@ -46,7 +45,6 @@ const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'recordings';
 
 // ─────────────────────────────────────────────
 //  Discord client
-//  FIX #3: Agregar Partials.Channel para que los DMs funcionen
 // ─────────────────────────────────────────────
 
 const client = new Client({
@@ -58,7 +56,7 @@ const client = new Client({
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.DirectMessages
     ],
-    partials: [Partials.Channel]   // ← FIX #3: sin esto los DMs no se pueden abrir
+    partials: [Partials.Channel]
 });
 
 // ─────────────────────────────────────────────
@@ -71,9 +69,10 @@ let connection      = null;
 let currentChannel  = null;
 let autoplay        = true;
 let disconnectTimer = null;
+let isConnecting    = false; // evita race conditions en auto-join
 
 // ─────────────────────────────────────────────
-//  Blacklist — persiste en /tmp/blacklist.json
+//  Blacklist
 // ─────────────────────────────────────────────
 
 const BLACKLIST_FILE = '/tmp/blacklist.json';
@@ -93,29 +92,14 @@ function saveBlacklist(set) {
 const blacklistedChannels = loadBlacklist();
 
 // ─────────────────────────────────────────────
-//  SoundCloud — obtener client_id al arrancar
-// ─────────────────────────────────────────────
-
-(async () => {
-    try {
-        const client_id = await play.getFreeClientID();
-        await play.setToken({ soundcloud: { client_id } });
-        console.log('✅ SoundCloud listo');
-    } catch (err) {
-        console.error('❌ SoundCloud init error:', err.message);
-    }
-})();
-
-// ─────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────
 
-function formatTime(ms) {
-    if (!ms) return '??:??';
-    const totalSec = Math.floor(ms / 1000);
-    const min = Math.floor(totalSec / 60);
-    const sec = totalSec % 60;
-    return `${min}:${sec.toString().padStart(2, '0')}`;
+function formatTime(sec) {
+    if (!sec || isNaN(sec)) return '??:??';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 function tmpPath(name) {
@@ -125,7 +109,7 @@ function tmpPath(name) {
 }
 
 // ─────────────────────────────────────────────
-//  Enviar MP3 por DM al usuario configurado
+//  DM al owner
 // ─────────────────────────────────────────────
 
 async function sendDmToOwner(mp3Path, remoteName) {
@@ -135,29 +119,22 @@ async function sendDmToOwner(mp3Path, remoteName) {
     try {
         const owner = await client.users.fetch(ownerId);
         if (!owner) return;
-
         const dmChannel = await owner.createDM();
 
         const stats = fs.statSync(mp3Path);
         const fileSizeMB = stats.size / (1024 * 1024);
 
         if (fileSizeMB > 25) {
-            const { data } = supabase.storage
-                .from(SUPABASE_BUCKET)
-                .getPublicUrl(remoteName);
-            await dmChannel.send(`🎙️ Nueva grabación (${fileSizeMB.toFixed(1)}MB — demasiado grande para adjuntar):\n${data.publicUrl}`);
+            const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(remoteName);
+            await dmChannel.send(`🎙️ Grabación (${fileSizeMB.toFixed(1)}MB):\n${data.publicUrl}`);
             return;
         }
 
-        const attachment = new AttachmentBuilder(mp3Path, {
-            name: path.basename(remoteName)
-        });
-
+        const attachment = new AttachmentBuilder(mp3Path, { name: path.basename(remoteName) });
         await dmChannel.send({
             content: `🎙️ Nueva grabación: \`${path.basename(remoteName)}\``,
             files: [attachment]
         });
-
         console.log(`📨 MP3 enviado por DM a ${ownerId}`);
     } catch (err) {
         console.error('❌ Error enviando DM:', err.message);
@@ -165,7 +142,7 @@ async function sendDmToOwner(mp3Path, remoteName) {
 }
 
 // ─────────────────────────────────────────────
-//  Subir MP3 a Supabase Storage y enviar DM
+//  Supabase upload
 // ─────────────────────────────────────────────
 
 async function uploadToSupabase(filePath, remoteName) {
@@ -173,16 +150,10 @@ async function uploadToSupabase(filePath, remoteName) {
         const fileBuffer = fs.readFileSync(filePath);
         const { error } = await supabase.storage
             .from(SUPABASE_BUCKET)
-            .upload(remoteName, fileBuffer, {
-                contentType: 'audio/mpeg',
-                upsert: true
-            });
-
+            .upload(remoteName, fileBuffer, { contentType: 'audio/mpeg', upsert: true });
         if (error) throw error;
-
-        console.log(`☁️  Subido a Supabase: ${remoteName}`);
+        console.log(`☁️  Subido: ${remoteName}`);
         await sendDmToOwner(filePath, remoteName);
-
     } catch (err) {
         console.error('❌ Error subiendo a Supabase:', err.message);
     } finally {
@@ -191,23 +162,17 @@ async function uploadToSupabase(filePath, remoteName) {
 }
 
 // ─────────────────────────────────────────────
-//  Convertir PCM → MP3 y subir
+//  PCM → MP3 → Supabase
 // ─────────────────────────────────────────────
 
 function convertAndUpload(pcmPath, remoteName) {
     if (!fs.existsSync(pcmPath)) return;
-
-    // Verificar que el PCM tenga datos reales antes de convertir
     try {
         const stat = fs.statSync(pcmPath);
-        if (stat.size < 1000) {          // menos de ~1KB = silencio / vacío
-            fs.unlinkSync(pcmPath);
-            return;
-        }
+        if (stat.size < 1000) { fs.unlinkSync(pcmPath); return; }
     } catch { return; }
 
     const mp3Path = pcmPath.replace('.pcm', '.mp3');
-
     ffmpeg(pcmPath)
         .inputFormat('s16le')
         .inputOptions(['-ar 48000', '-ac 2'])
@@ -226,44 +191,27 @@ function convertAndUpload(pcmPath, remoteName) {
 }
 
 // ─────────────────────────────────────────────
-//  Grabación en chunks de 20s por usuario
-//  FIX #2: lógica de chunks corregida
+//  Grabación continua con silencio de 6s
 // ─────────────────────────────────────────────
 
-// ─────────────────────────────────────────────
-//  Grabación continua del canal
-//  - Una sola sesión de grabación por guild
-//  - Graba a todos los usuarios que hablan mezclados en un PCM
-//  - Espera 6s de silencio total en el canal antes de cerrar y subir
-//  - Si la sesión supera 20min, la corta y sube y abre una nueva
-// ─────────────────────────────────────────────
+const SILENCE_TIMEOUT_MS = 6_000;
+const MAX_SESSION_MS     = 20 * 60 * 1000;
 
-const SILENCE_TIMEOUT_MS = 6_000;   // 6s sin que nadie hable → cortar y subir
-const MAX_SESSION_MS     = 20 * 60 * 1000; // 20 min máximo por sesión
-
-// Estado de la sesión de grabación actual (una por guild)
 let recSession = null;
-// { guildId, pcmPath, remoteName, writeStream, userStreams: Map<userId, {opus,decoder}>,
-//   silenceTimer, maxTimer, startedAt }
 
 function _flushSession() {
     if (!recSession) return;
     const { silenceTimer, maxTimer, writeStream, pcmPath, remoteName, userStreams } = recSession;
-
     clearTimeout(silenceTimer);
     clearTimeout(maxTimer);
-
-    // Cerrar todos los streams de usuarios activos
     for (const [, s] of userStreams) {
         try { s.opus.destroy(); } catch {}
     }
     userStreams.clear();
-
     recSession = null;
-
     writeStream.end();
     writeStream.once('finish', () => {
-        console.log(`🎙️ Sesión terminada → convirtiendo ${pcmPath}`);
+        console.log(`🎙️ Sesión terminada → ${pcmPath}`);
         convertAndUpload(pcmPath, remoteName);
     });
 }
@@ -279,94 +227,61 @@ function _resetSilenceTimer() {
 
 function _subscribeUser(receiver, userId) {
     if (!recSession) return;
-    if (recSession.userStreams.has(userId)) return; // ya suscrito
+    if (recSession.userStreams.has(userId)) return;
 
     const opus = receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
     });
     const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-
     opus.pipe(decoder);
-    decoder.on('data', (chunk) => {
-        if (recSession) recSession.writeStream.write(chunk);
-    });
-
+    decoder.on('data', (chunk) => { if (recSession) recSession.writeStream.write(chunk); });
     opus.on('end', () => {
-        if (!recSession) return;
-        recSession.userStreams.delete(userId);
-        console.log(`🔇 ${userId} dejó de hablar`);
-        // Reiniciar el timer de silencio cuando alguien para
+        if (recSession) recSession.userStreams.delete(userId);
         _resetSilenceTimer();
     });
-
-    opus.on('error', () => {
-        if (recSession) recSession.userStreams.delete(userId);
-    });
-
+    opus.on('error', () => { if (recSession) recSession.userStreams.delete(userId); });
     recSession.userStreams.set(userId, { opus, decoder });
-    console.log(`🎙️ Suscrito a: ${userId}`);
+    console.log(`🎙️ Suscrito: ${userId}`);
 }
 
 function startRecording(conn, guildId) {
     conn.receiver.speaking.on('start', (userId) => {
         if (!recSession) {
-            // Iniciar nueva sesión
-            const ts         = Date.now();
-            const pcmPath    = tmpPath(`${guildId}_session_${ts}.pcm`);
-            const remoteName = `${guildId}/session_${ts}.mp3`;
+            const ts          = Date.now();
+            const pcmPath     = tmpPath(`${guildId}_session_${ts}.pcm`);
+            const remoteName  = `${guildId}/session_${ts}.mp3`;
             const writeStream = fs.createWriteStream(pcmPath);
-
-            recSession = {
-                guildId,
-                pcmPath,
-                remoteName,
-                writeStream,
-                userStreams: new Map(),
-                silenceTimer: null,
-                maxTimer: null,
-                startedAt: ts
-            };
-
-            // Timer máximo de seguridad (20 min)
+            recSession = { guildId, pcmPath, remoteName, writeStream, userStreams: new Map(), silenceTimer: null, maxTimer: null };
             recSession.maxTimer = setTimeout(() => {
-                console.log('⏱️ Sesión de 20min alcanzada — rotando');
+                console.log('⏱️ Sesión 20min — rotando');
                 _flushSession();
             }, MAX_SESSION_MS);
-
-            console.log(`🎤 Nueva sesión de grabación: ${pcmPath}`);
+            console.log(`🎤 Nueva sesión: ${pcmPath}`);
         }
-
-        // Cancelar el timer de silencio porque alguien habló
         clearTimeout(recSession.silenceTimer);
         recSession.silenceTimer = null;
-
         _subscribeUser(conn.receiver, userId);
     });
-
     console.log('🎤 Grabación activa');
 }
 
-function stopAllRecordings() {
-    _flushSession();
-}
+function stopAllRecordings() { _flushSession(); }
 
 // ─────────────────────────────────────────────
 //  Conectar al voice channel
-//  FIX #1: esperar estado Ready con entersState en vez de setTimeout
 // ─────────────────────────────────────────────
 
 async function connectToChannel(voiceChannel) {
-    if (blacklistedChannels.has(voiceChannel.id)) {
-        console.log(`🚫 Canal en blacklist: ${voiceChannel.name}`);
-        return false;
-    }
+    if (blacklistedChannels.has(voiceChannel.id)) return false;
 
+    // Ya estamos en ese canal
     if (connection &&
         connection.state.status !== VoiceConnectionStatus.Destroyed &&
         connection.joinConfig?.channelId === voiceChannel.id) {
         return true;
     }
 
+    // Limpiar conexión anterior
     if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
         stopAllRecordings();
         try { connection.destroy(); } catch {}
@@ -377,34 +292,44 @@ async function connectToChannel(voiceChannel) {
         channelId:      voiceChannel.id,
         guildId:        voiceChannel.guild.id,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        selfDeaf:       false
+        selfDeaf:       false,
+        selfMute:       false
+    });
+
+    // Manejar desconexión inesperada — intentar reconectar automáticamente
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+            // Discord a veces manda Disconnected antes de reconectar (mov de canal)
+            await Promise.race([
+                entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+            ]);
+            // Se está reconectando solo, no hacer nada
+        } catch {
+            // No se reconectó — destruir limpiamente
+            console.log('🔌 Desconexión permanente detectada');
+            try { connection.destroy(); } catch {}
+        }
     });
 
     connection.on(VoiceConnectionStatus.Destroyed, () => {
         connection = null;
         queue = [];
         stopAllRecordings();
+        console.log('🔴 Conexión destruida');
     });
 
-    // En Railway el handshake UDP puede tardar o no llegar a Ready
-    // aunque el bot SÍ está en el canal. Esperamos Ready pero si
-    // timeout, verificamos que al menos esté en Signalling/Connecting
-    // y continuamos igual — Discord reproduce audio en ese estado.
+    // Esperar Ready con fallback para Railway
     try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-        console.log(`✅ Conectado (Ready) a: ${voiceChannel.name}`);
+        console.log(`✅ Conectado a: ${voiceChannel.name}`);
     } catch {
         const status = connection.state.status;
-        if (
-            status === VoiceConnectionStatus.Ready      ||
-            status === VoiceConnectionStatus.Signalling ||
-            status === VoiceConnectionStatus.Connecting
-        ) {
-            console.warn(`⚠️  Timeout esperando Ready (estado actual: ${status}) — continuando de todas formas`);
-            // Esperar un poco más para el handshake UDP
+        if ([VoiceConnectionStatus.Signalling, VoiceConnectionStatus.Connecting].includes(status)) {
+            console.warn(`⚠️ Timeout Ready (estado: ${status}) — continuando`);
             await new Promise(r => setTimeout(r, 3_000));
         } else {
-            console.error(`❌ Conexión fallida con estado: ${status}`);
+            console.error(`❌ No se pudo conectar (estado: ${status})`);
             try { connection.destroy(); } catch {}
             connection = null;
             return false;
@@ -417,20 +342,43 @@ async function connectToChannel(voiceChannel) {
 }
 
 // ─────────────────────────────────────────────
-//  Auto-join
+//  Auto-join — también maneja reconexión cuando
+//  el bot es desconectado manualmente
 // ─────────────────────────────────────────────
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
+    // Detectar cuando el BOT es desconectado manualmente
+    if (oldState.member?.user?.id === client.user?.id) {
+        if (oldState.channelId && !newState.channelId) {
+            // El bot fue sacado del canal
+            console.log('🔌 Bot desconectado manualmente — esperando para reconectar');
+            connection = null;
+            queue = [];
+            stopAllRecordings();
+        }
+        return;
+    }
+
     if (newState.member?.user?.bot) return;
 
+    // Usuario entró a un canal → auto-join
     if (!oldState.channelId && newState.channelId) {
         const channel = newState.channel;
         if (!channel) return;
         if (blacklistedChannels.has(channel.id)) return;
-        if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) return;
+        if (isConnecting) return;
+
+        // Solo entrar si no hay conexión activa
+        const alreadyConnected = connection &&
+            connection.state.status !== VoiceConnectionStatus.Destroyed &&
+            connection.state.status !== VoiceConnectionStatus.Disconnected;
+
+        if (alreadyConnected) return;
 
         console.log(`👤 Auto-join: ${channel.name}`);
+        isConnecting = true;
         await connectToChannel(channel);
+        isConnecting = false;
     }
 
     if (oldState.channelId) checkEmptyChannel();
@@ -445,7 +393,6 @@ function checkEmptyChannel() {
 
     const channelId = connection.joinConfig?.channelId;
     if (!channelId) return;
-
     const channel = client.channels.cache.get(channelId);
     if (!channel) return;
 
@@ -457,7 +404,6 @@ function checkEmptyChannel() {
             disconnectTimer = setTimeout(() => {
                 const ch = client.channels.cache.get(channelId);
                 const stillEmpty = !ch || ch.members.filter((m) => !m.user.bot).size === 0;
-
                 if (stillEmpty && connection) {
                     console.log('👋 Desconectando (canal vacío)');
                     queue = [];
@@ -470,15 +416,14 @@ function checkEmptyChannel() {
             }, 10_000);
         }
     } else {
-        if (disconnectTimer) {
-            clearTimeout(disconnectTimer);
-            disconnectTimer = null;
-        }
+        if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
     }
 }
 
 // ─────────────────────────────────────────────
-//  Reproducción
+//  Reproducción — YouTube con play-dl
+//  Busca en YouTube, stream directo WebM/Opus
+//  → StreamType.WebmOpus (sin re-encodear, máx calidad)
 // ─────────────────────────────────────────────
 
 async function playMusic(channel) {
@@ -487,32 +432,31 @@ async function playMusic(channel) {
     const song = queue[0];
 
     try {
-        const cid = await play.getFreeClientID();
-        await play.setToken({ soundcloud: { client_id: cid } });
+        // Buscar video en YouTube y obtener stream WebM/Opus
+        const stream = await play.stream(song.url, { quality: 2 });
 
-        const scStream = await play.stream(song.url);
-        console.log(`🎵 Stream type: ${scStream.type}, stream: ${scStream.stream.constructor.name}`);
+        console.log(`▶️ Stream listo — type: ${stream.type}`);
 
-        // El SoundCloudStream de play-dl es un Readable que entrega audio HLS segmentado.
-        // createAudioResource con StreamType.Arbitrary lo acepta directamente —
-        // @discordjs/voice usa ffmpeg internamente para transcodificar a Opus.
-        const resource = createAudioResource(scStream.stream, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: false
-        });
+        // WebmOpus = Opus nativo dentro de un contenedor WebM
+        // @discordjs/voice lo puede pasar directamente a Discord sin re-encodear
+        // Resultado: latencia mínima, calidad máxima, 0 uso de ffmpeg
+        const inputType = stream.type === StreamType.WebmOpus
+            ? StreamType.WebmOpus
+            : StreamType.Arbitrary;
 
+        const resource = createAudioResource(stream.stream, { inputType });
         player.play(resource);
         connection.subscribe(player);
 
         const embed = new EmbedBuilder()
-            .setColor('#00ffcc')
+            .setColor('#ff0000')
             .setTitle('🎵 Reproduciendo')
             .setDescription(`**${song.title || '🎶 Desconocido'}**`)
             .addFields(
-                { name: '⏱️ Duración',  value: song.duration || '??:??',   inline: true },
-                { name: '👤 Pedido por', value: song.user || 'Desconocido', inline: true }
+                { name: '⏱️ Duración',   value: song.duration || '??:??',    inline: true },
+                { name: '👤 Pedido por', value: song.user     || 'Desconocido', inline: true }
             )
-            .setFooter({ text: `En cola: ${queue.length - 1}` });
+            .setFooter({ text: `En cola: ${queue.length - 1} | YouTube` });
 
         if (song.thumbnail) embed.setThumbnail(song.thumbnail);
 
@@ -527,7 +471,7 @@ async function playMusic(channel) {
     } catch (err) {
         console.error('❌ Error reproduciendo:', err.message);
         queue.shift();
-        playMusic(channel);
+        if (queue.length) playMusic(channel);
     }
 }
 
@@ -536,32 +480,32 @@ player.on(AudioPlayerStatus.Idle, async () => {
 
     if (!queue.length && autoplay) {
         try {
-            const cid = await play.getFreeClientID();
-            await play.setToken({ soundcloud: { client_id: cid } });
-
-            const random = await play.search('lofi', {
-                source: { soundcloud: 'tracks' }, limit: 1
+            const results = await play.search('lofi hip hop music', {
+                source: { youtube: 'video' },
+                limit: 5
             });
-            if (random.length) {
-                const t = random[0];
+            if (results.length) {
+                const t = results[Math.floor(Math.random() * results.length)];
                 queue.push({
-                    title:     t.title || t.name || 'Autoplay',
+                    title:     t.title,
                     url:       t.url,
-                    duration:  formatTime((t.durationInSec || 0) * 1000),
-                    thumbnail: t.thumbnail?.url || null,
+                    duration:  formatTime(t.durationInSec),
+                    thumbnail: t.thumbnails?.[0]?.url || null,
                     user:      'Autoplay'
                 });
             }
-        } catch {}
+        } catch (err) {
+            console.error('❌ Autoplay error:', err.message);
+        }
     }
 
-    if (currentChannel) playMusic(currentChannel);
+    if (currentChannel && queue.length) playMusic(currentChannel);
 });
 
 player.on('error', (err) => {
     console.error('❌ Player error:', err.message);
     queue.shift();
-    if (currentChannel) playMusic(currentChannel);
+    if (currentChannel && queue.length) playMusic(currentChannel);
 });
 
 // ─────────────────────────────────────────────
@@ -578,7 +522,7 @@ client.on('messageCreate', async (msg) => {
     if (cmd === 'help') {
         return msg.reply([
             '🎵 **Comandos disponibles**',
-            '`-play <nombre>` — Buscar y reproducir en SoundCloud',
+            '`-play <nombre>` — Buscar y reproducir en YouTube',
             '`-pause` — Pausar',
             '`-resume` — Reanudar',
             '`-skip` — Saltar canción',
@@ -586,7 +530,7 @@ client.on('messageCreate', async (msg) => {
             '`-autoplay` — Activar/desactivar autoplay lofi',
             '`-mov` — Mover el bot a tu canal de voz',
             '`-stop` — Detener y desconectar',
-            '`-blacklist <channel_id>` — Bloquear/desbloquear canal (toggle)',
+            '`-blacklist <channel_id>` — Bloquear/desbloquear canal',
             '`-blacklist list` — Ver canales bloqueados',
         ].join('\n'));
     }
@@ -610,22 +554,29 @@ client.on('messageCreate', async (msg) => {
         const loadMsg = await msg.reply(`🔍 Buscando **${query}**...`);
 
         try {
-            const cid = await play.getFreeClientID();
-            await play.setToken({ soundcloud: { client_id: cid } });
+            // Detectar si es URL de YouTube directa o búsqueda
+            let track;
+            const ytValidate = play.yt_validate(query);
 
-            const results = await play.search(query, {
-                source: { soundcloud: 'tracks' },
-                limit: 1
-            });
+            if (ytValidate === 'video') {
+                // URL directa de YouTube
+                const info = await play.video_info(query);
+                track = info.video_details;
+            } else {
+                // Búsqueda por nombre
+                const results = await play.search(query, {
+                    source: { youtube: 'video' },
+                    limit: 1
+                });
+                if (!results.length) return loadMsg.edit('❌ No encontré nada en YouTube.');
+                track = results[0];
+            }
 
-            if (!results.length) return loadMsg.edit('❌ No encontré nada en SoundCloud.');
-
-            const track = results[0];
             const song = {
-                title:     track.title || track.name || '🎶 Desconocido',
+                title:     track.title || '🎶 Desconocido',
                 url:       track.url,
-                duration:  formatTime((track.durationInSec || 0) * 1000),
-                thumbnail: track.thumbnail?.url || null,
+                duration:  formatTime(track.durationInSec),
+                thumbnail: track.thumbnails?.[0]?.url || null,
                 user:      msg.author.username
             };
 
@@ -678,7 +629,6 @@ client.on('messageCreate', async (msg) => {
 
         stopAllRecordings();
         if (connection) { try { connection.destroy(); } catch {} connection = null; }
-
         const ok = await connectToChannel(vc);
         if (!ok) return msg.reply('❌ No pude moverme a ese canal.');
         return msg.reply(`✅ Movido a **${vc.name}**`);
@@ -710,9 +660,7 @@ client.on('messageCreate', async (msg) => {
             blacklistedChannels.add(channelId);
             saveBlacklist(blacklistedChannels);
             if (connection?.joinConfig?.channelId === channelId) {
-                queue = [];
-                player.stop();
-                stopAllRecordings();
+                queue = []; player.stop(); stopAllRecordings();
                 try { connection.destroy(); } catch {}
                 connection = null;
             }
